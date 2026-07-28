@@ -1536,7 +1536,61 @@ fn set_terminal_title() {
     let _ = std::io::stdout().flush();
 }
 
-pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
+fn terminal_width() -> Option<usize> {
+    Term::stdout()
+        .size_checked()
+        .map(|(_height, width)| width as usize)
+}
+
+const MIN_NAME_GAP: usize = 2;
+const MIN_NAME_WIDTH: usize = 12;
+/// A line that fills the terminal exactly makes the cursor wrap, so the trailing
+/// newline would cost an extra blank line before every prompt.
+const RIGHT_EDGE_RESERVE: usize = 1;
+
+#[derive(Debug, PartialEq)]
+enum SessionNameSlot {
+    Hidden,
+    Shown { padding: usize, name: String },
+}
+
+fn place_session_name(left_width: usize, name: &str, term_width: Option<usize>) -> SessionNameSlot {
+    let Some(term_width) = term_width else {
+        return SessionNameSlot::Hidden;
+    };
+
+    let usable = term_width.saturating_sub(RIGHT_EDGE_RESERVE);
+
+    let room = usable
+        .saturating_sub(left_width)
+        .saturating_sub(MIN_NAME_GAP);
+
+    if room < MIN_NAME_WIDTH {
+        return SessionNameSlot::Hidden;
+    }
+
+    let name_width = measure_text_width(name);
+    let shown_name = if room >= name_width {
+        name.to_string()
+    } else {
+        safe_truncate(name, room)
+    };
+
+    let padding = usable
+        .saturating_sub(left_width)
+        .saturating_sub(measure_text_width(&shown_name));
+
+    SessionNameSlot::Shown {
+        padding,
+        name: shown_name,
+    }
+}
+
+pub fn display_context_usage(
+    total_tokens: usize,
+    context_limit: usize,
+    session_name: Option<&str>,
+) {
     use console::style;
 
     if context_limit == 0 {
@@ -1573,7 +1627,7 @@ pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
         }
     }
 
-    println!(
+    let left = format!(
         "  {} {} {}",
         colored_bar,
         style(format!("{}%", percentage)).dim(),
@@ -1584,6 +1638,17 @@ pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
         ))
         .dim(),
     );
+
+    let name_slot = session_name
+        .map(|name| place_session_name(measure_text_width(&left), name, terminal_width()))
+        .unwrap_or(SessionNameSlot::Hidden);
+
+    match name_slot {
+        SessionNameSlot::Hidden => println!("{}", left),
+        SessionNameSlot::Shown { padding, name } => {
+            println!("{}{}{}", left, " ".repeat(padding), style(name).dim())
+        }
+    }
 }
 
 fn estimate_cost_usd(provider: &str, model: &str, usage: &Usage) -> Option<f64> {
@@ -1824,6 +1889,30 @@ mod tests {
     }
 
     #[test]
+    fn place_session_name_shows_full_name_ending_one_short_of_the_edge() {
+        let name = "Fix the checkout rounding";
+        let left_width = 30;
+        let term_width = 100;
+
+        let slot = place_session_name(left_width, name, Some(term_width));
+
+        match slot {
+            SessionNameSlot::Shown {
+                padding,
+                name: shown,
+            } => {
+                assert_eq!(shown, name);
+                assert_eq!(
+                    left_width + padding + measure_text_width(&shown),
+                    term_width - 1,
+                    "the line must stay one column short so the terminal does not wrap"
+                );
+            }
+            SessionNameSlot::Hidden => panic!("expected the name to be shown"),
+        }
+    }
+
+    #[test]
     fn format_string_value_reports_hidden_count_over_budget() {
         let content = (1..=25)
             .map(|i| format!("line {i}"))
@@ -1898,5 +1987,52 @@ mod tests {
             "todo_write"
         );
         assert_eq!(dispatch_name, "todo__todo_write");
+    }
+
+    #[test]
+    fn place_session_name_hidden_without_terminal_width() {
+        let slot = place_session_name(10, "any name", None);
+        assert_eq!(slot, SessionNameSlot::Hidden);
+    }
+
+    #[test]
+    fn place_session_name_hidden_when_room_below_minimum() {
+        let slot = place_session_name(90, "short", Some(100));
+        assert_eq!(slot, SessionNameSlot::Hidden);
+    }
+
+    #[test]
+    fn place_session_name_truncates_name_longer_than_room() {
+        let left_width = 10;
+        let term_width = 100;
+        let room = term_width - RIGHT_EDGE_RESERVE - left_width - MIN_NAME_GAP;
+        let name = "x".repeat(200);
+
+        let slot = place_session_name(left_width, &name, Some(term_width));
+
+        match slot {
+            SessionNameSlot::Shown { name: shown, .. } => {
+                assert_eq!(measure_text_width(&shown), room);
+            }
+            SessionNameSlot::Hidden => panic!("expected the name to be shown, truncated"),
+        }
+    }
+
+    #[test]
+    fn place_session_name_truncates_multibyte_name_without_splitting_a_character() {
+        let left_width = 0;
+        let term_width = 16;
+        let room = term_width - RIGHT_EDGE_RESERVE - left_width - MIN_NAME_GAP;
+        let name = "日".repeat(50);
+
+        let slot = place_session_name(left_width, &name, Some(term_width));
+
+        match slot {
+            SessionNameSlot::Shown { name: shown, .. } => {
+                assert!(std::str::from_utf8(shown.as_bytes()).is_ok());
+                assert!(shown.chars().count() <= room);
+            }
+            SessionNameSlot::Hidden => panic!("expected the name to be shown, truncated"),
+        }
     }
 }

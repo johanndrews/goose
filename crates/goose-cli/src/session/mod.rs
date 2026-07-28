@@ -1922,7 +1922,7 @@ impl CliSession {
             Ok(metadata) => {
                 let total_tokens = metadata.usage.total_tokens.unwrap_or(0) as usize;
 
-                output::display_context_usage(total_tokens, context_limit);
+                output::display_context_usage(total_tokens, context_limit, Some(&metadata.name));
 
                 if show_cost {
                     output::display_cost_usage(
@@ -1933,7 +1933,7 @@ impl CliSession {
                 }
             }
             Err(_) => {
-                output::display_context_usage(0, context_limit);
+                output::display_context_usage(0, context_limit, None);
             }
         }
 
