@@ -506,7 +506,7 @@ fn render_tool_request(req: &ToolRequest, theme: Theme, debug: bool) {
             "execute_typescript" | "execute_code" => render_execute_code_request(call, debug),
             "delegate" => render_delegate_request(call, debug),
             "subagent" => render_delegate_request(call, debug),
-            "todo__write" => render_todo_request(call, debug),
+            "todo__todo_write" => render_todo_request(call, debug),
             "load" => {}
             _ => render_default_request(call, debug),
         },
@@ -586,7 +586,7 @@ fn print_tool_output(text: &str) {
         println!(
             "    {}",
             style(format!(
-                "... ({} lines hidden, /toggle to show all)",
+                "... ({} lines hidden, /r to show all)",
                 lines.len() - head - tail
             ))
             .dim()
@@ -834,12 +834,93 @@ fn render_delegate_request(call: &CallToolRequestParams, debug: bool) {
     println!();
 }
 
-fn render_todo_request(call: &CallToolRequestParams, _debug: bool) {
+struct TodoSummary {
+    open: usize,
+    done: usize,
+    next_open: Vec<String>,
+}
+
+fn checkbox_item(trimmed: &str) -> Option<(bool, &str)> {
+    let rest = trimmed.strip_prefix("- [")?;
+    let mut chars = rest.chars();
+    let mark = chars.next()?;
+    if chars.next()? != ']' {
+        return None;
+    }
+    let done = match mark {
+        ' ' => false,
+        'x' | 'X' => true,
+        _ => return None,
+    };
+    Some((done, chars.as_str().trim_start()))
+}
+
+fn summarize_todos(content: &str) -> Option<TodoSummary> {
+    let mut summary = TodoSummary {
+        open: 0,
+        done: 0,
+        next_open: Vec::new(),
+    };
+
+    for line in content.lines() {
+        let Some((done, text)) = checkbox_item(line.trim_start()) else {
+            continue;
+        };
+        if done {
+            summary.done += 1;
+        } else {
+            summary.open += 1;
+            if summary.next_open.len() < 3 {
+                summary.next_open.push(text.to_string());
+            }
+        }
+    }
+
+    if summary.open == 0 && summary.done == 0 {
+        None
+    } else {
+        Some(summary)
+    }
+}
+
+fn print_todo_summary(summary: &TodoSummary) {
+    println!(
+        "{}{}",
+        INDENT,
+        style(format!("{} open · {} done", summary.open, summary.done)).dim()
+    );
+
+    let item_indent = INDENT.repeat(2);
+    for item in &summary.next_open {
+        println!("{}- [ ] {}", item_indent, style(item).dim());
+    }
+
+    let remaining = summary.open.saturating_sub(summary.next_open.len());
+    if remaining > 0 {
+        println!(
+            "{}{}",
+            item_indent,
+            style(format!("... ({} more open)", remaining))
+                .dim()
+                .italic()
+        );
+    }
+}
+
+fn render_todo_request(call: &CallToolRequestParams, debug: bool) {
     print_tool_header(call);
 
     if let Some(args) = &call.arguments {
         if let Some(Value::String(content)) = args.get("content") {
-            println!("    {} {}", style("content").dim(), style(content).dim());
+            match summarize_todos(content) {
+                Some(summary) => print_todo_summary(&summary),
+                None => print_value_with_prefix(
+                    &format!("{}{}: ", INDENT, style("content").dim()),
+                    &Value::String(content.clone()),
+                    debug,
+                    1,
+                ),
+            }
         }
     }
     println!();
@@ -1168,24 +1249,99 @@ fn print_table(table_lines: &[&str], theme: Theme) {
 }
 
 const INDENT: &str = "    ";
+const MULTILINE_VALUE_MAX_LINES: usize = 20;
 
-fn print_value_with_prefix(prefix: &String, value: &Value, debug: bool) {
-    let prefix_width = measure_text_width(prefix.as_str());
-    print!("{}", prefix);
-    print_value(value, debug, prefix_width)
+enum ValueLines {
+    Single(String),
+    Multi { lines: Vec<String>, hidden: usize },
 }
 
-fn print_value(value: &Value, debug: bool, reserve_width: usize) {
-    let max_width = Term::stdout()
-        .size_checked()
-        .map(|(_h, w)| (w as usize).saturating_sub(reserve_width));
-    let show_full = get_show_full_tool_output();
-    let formatted = match value {
-        Value::String(s) => match (max_width, debug || show_full) {
-            (Some(w), false) if s.len() > w => style(safe_truncate(s, w)),
-            _ => style(s.to_string()),
+fn truncate_line(line: &str, max_width: Option<usize>, show_full: bool) -> String {
+    match max_width {
+        Some(w) if !show_full && line.len() > w => safe_truncate(line, w),
+        _ => line.to_string(),
+    }
+}
+
+fn format_string_value(
+    s: &str,
+    max_width: Option<usize>,
+    show_full: bool,
+    max_lines: usize,
+) -> ValueLines {
+    if !s.contains('\n') {
+        return ValueLines::Single(truncate_line(s, max_width, show_full));
+    }
+
+    let all_lines: Vec<&str> = s.lines().collect();
+    let (visible, hidden) = if show_full || all_lines.len() <= max_lines {
+        (&all_lines[..], 0)
+    } else {
+        (&all_lines[..max_lines], all_lines.len() - max_lines)
+    };
+
+    ValueLines::Multi {
+        lines: visible
+            .iter()
+            .map(|line| truncate_line(line, max_width, show_full))
+            .collect(),
+        hidden,
+    }
+}
+
+fn print_value_with_prefix(prefix: &str, value: &Value, debug: bool, depth: usize) {
+    let prefix_width = measure_text_width(prefix);
+    let spans_lines = matches!(value, Value::String(s) if s.contains('\n'));
+    print!(
+        "{}",
+        if spans_lines {
+            prefix.trim_end()
+        } else {
+            prefix
         }
-        .green(),
+    );
+    print_value(value, debug, prefix_width, depth)
+}
+
+fn print_value(value: &Value, debug: bool, reserve_width: usize, depth: usize) {
+    let content_indent = INDENT.repeat(depth + 1);
+    let width_for = |reserve: usize| {
+        Term::stdout()
+            .size_checked()
+            .map(|(_h, w)| (w as usize).saturating_sub(reserve))
+    };
+    let show_full = debug || get_show_full_tool_output();
+
+    if let Value::String(s) = value {
+        // Multi-line values are indented on their own lines, so the prefix no
+        // longer eats into the space available for them.
+        let max_width = if s.contains('\n') {
+            width_for(content_indent.len())
+        } else {
+            width_for(reserve_width)
+        };
+        match format_string_value(s, max_width, show_full, MULTILINE_VALUE_MAX_LINES) {
+            ValueLines::Single(line) => println!("{}", style(line).green()),
+            ValueLines::Multi { lines, hidden } => {
+                println!();
+                for line in &lines {
+                    println!("{}{}", content_indent, style(line).green());
+                }
+                if hidden > 0 {
+                    println!(
+                        "{}{}",
+                        content_indent,
+                        style(format!("... ({} lines hidden, /r to show all)", hidden))
+                            .dim()
+                            .italic()
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    let formatted = match value {
         Value::Number(n) => style(n.to_string()).yellow(),
         Value::Bool(b) => style(b.to_string()).yellow(),
         Value::Null => style("null".to_string()).dim(),
@@ -1230,6 +1386,7 @@ fn print_params(value: &Option<JsonObject>, depth: usize, debug: bool) {
                             &format!("{}{}: ", indent, style(key).dim()),
                             &Value::String(joined_values),
                             debug,
+                            depth,
                         );
                     } else {
                         // Use the original multi-line format for complex arrays
@@ -1249,6 +1406,7 @@ fn print_params(value: &Option<JsonObject>, depth: usize, debug: bool) {
                         &format!("{}{}: ", indent, style(key).dim()),
                         val,
                         debug,
+                        depth,
                     );
                 }
             }
@@ -1637,5 +1795,108 @@ mod tests {
             json!({"top_up_url": "https://router.tetrate.ai/billing"}),
         );
         assert_eq!(get_credits_top_up_url(&message), None);
+    }
+
+    #[test]
+    fn format_string_value_single_line_unchanged() {
+        assert!(matches!(
+            format_string_value("short value", Some(80), false, 20),
+            ValueLines::Single(ref s) if s == "short value"
+        ));
+
+        let long = "x".repeat(50);
+        let truncated = safe_truncate(&long, 10);
+        assert!(matches!(
+            format_string_value(&long, Some(10), false, 20),
+            ValueLines::Single(ref s) if *s == truncated
+        ));
+    }
+
+    #[test]
+    fn format_string_value_splits_multiline() {
+        match format_string_value("a\nb\nc", None, false, 20) {
+            ValueLines::Multi { lines, hidden } => {
+                assert_eq!(lines, vec!["a", "b", "c"]);
+                assert_eq!(hidden, 0);
+            }
+            ValueLines::Single(_) => panic!("expected Multi"),
+        }
+    }
+
+    #[test]
+    fn format_string_value_reports_hidden_count_over_budget() {
+        let content = (1..=25)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        match format_string_value(&content, None, false, 20) {
+            ValueLines::Multi { lines, hidden } => {
+                assert_eq!(lines.len(), 20);
+                assert_eq!(hidden, 5);
+                assert_eq!(lines[0], "line 1");
+                assert_eq!(lines[19], "line 20");
+            }
+            ValueLines::Single(_) => panic!("expected Multi"),
+        }
+    }
+
+    #[test]
+    fn format_string_value_show_full_returns_everything() {
+        let content = (1..=25)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        match format_string_value(&content, None, true, 20) {
+            ValueLines::Multi { lines, hidden } => {
+                assert_eq!(lines.len(), 25);
+                assert_eq!(hidden, 0);
+            }
+            ValueLines::Single(_) => panic!("expected Multi"),
+        }
+    }
+
+    #[test]
+    fn summarize_todos_counts_open_and_done() {
+        let content = "- [ ] task one\n- [x] task two\n- [ ] task three";
+        let summary = summarize_todos(content).expect("expected checkboxes");
+        assert_eq!(summary.open, 2);
+        assert_eq!(summary.done, 1);
+    }
+
+    #[test]
+    fn summarize_todos_handles_indented_items() {
+        let content = "- [ ] parent\n  - [ ] child\n  - [X] done child";
+        let summary = summarize_todos(content).expect("expected checkboxes");
+        assert_eq!(summary.open, 2);
+        assert_eq!(summary.done, 1);
+    }
+
+    #[test]
+    fn summarize_todos_returns_first_three_open_items() {
+        let content = "- [ ] one\n- [ ] two\n- [ ] three\n- [ ] four";
+        let summary = summarize_todos(content).expect("expected checkboxes");
+        assert_eq!(summary.open, 4);
+        assert_eq!(summary.next_open, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn summarize_todos_none_for_prose_without_checkboxes() {
+        let content = "Just a plain status update.\nNo checkboxes here.";
+        assert!(summarize_todos(content).is_none());
+    }
+
+    #[test]
+    fn todo_dispatch_name_matches_extension_manager() {
+        // extension_manager.rs builds `format!("{}__{}", name, tool.name)` per
+        // extension; "todo_write" is the literal tool name registered in
+        // platform_extensions/todo.rs's `get_tools()` (`Tool::new("todo_write", ...)`).
+        let dispatch_name = format!(
+            "{}__{}",
+            goose::agents::platform_extensions::todo::EXTENSION_NAME,
+            "todo_write"
+        );
+        assert_eq!(dispatch_name, "todo__todo_write");
     }
 }
