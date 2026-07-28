@@ -214,6 +214,7 @@ pub struct CompletionCache {
     pub provider_names: Vec<String>,
     pub provider_models: HashMap<String, Vec<String>>,
     pub current_session_provider: String,
+    pub slash_commands: Vec<String>,
     pub last_updated: Instant,
     pub hint_status: HintStatus,
 }
@@ -226,6 +227,7 @@ impl CompletionCache {
             provider_names: Vec::new(),
             provider_models: HashMap::new(),
             current_session_provider: String::new(),
+            slash_commands: Vec::new(),
             last_updated: Instant::now(),
             hint_status: HintStatus::Default,
         }
@@ -1770,6 +1772,16 @@ impl CliSession {
         let prompts = self.agent.list_extension_prompts(&self.session_id).await;
         let all_providers = goose::providers::providers().await;
         let session_provider = self.agent.provider().await?.get_name().to_string();
+        let working_dir = self
+            .get_session()
+            .await
+            .ok()
+            .map(|session| session.working_dir);
+        let slash_commands: Vec<String> =
+            goose::slash_commands::slash_command::list_acp_commands(working_dir.as_deref())
+                .into_iter()
+                .map(|command| command.name)
+                .collect();
 
         let provider_ids: Vec<String> = all_providers.iter().map(|(m, _)| m.name.clone()).collect();
         let inventory_models: HashMap<String, Vec<String>> = {
@@ -1846,6 +1858,7 @@ impl CliSession {
             cache.provider_models.insert(metadata.name.clone(), models);
         }
 
+        cache.slash_commands = slash_commands;
         cache.last_updated = Instant::now();
         Ok(())
     }
