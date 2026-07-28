@@ -231,8 +231,9 @@ impl GooseCompleter {
         Ok((pos, candidates))
     }
 
-    /// Complete slash commands
-    fn complete_slash_commands(&self, line: &str) -> Result<(usize, Vec<Pair>)> {
+    /// All known slash commands: built-in CLI commands plus the cached custom commands
+    /// (or `list_commands()` when the cache hasn't been populated yet).
+    fn known_commands(&self) -> Vec<String> {
         let mut commands = vec![
             "/exit".to_string(),
             "/quit".to_string(),
@@ -260,6 +261,12 @@ impl GooseCompleter {
 
         commands.sort();
         commands.dedup();
+        commands
+    }
+
+    /// Complete slash commands
+    fn complete_slash_commands(&self, line: &str) -> Result<(usize, Vec<Pair>)> {
+        let commands = self.known_commands();
 
         // Find commands that match the prefix
         let matching_commands: Vec<Pair> = commands
@@ -414,6 +421,38 @@ impl GooseCompleter {
     }
 }
 
+/// The remainder of the unambiguous command that starts with `line`, or `None` if the line
+/// isn't a bare command prefix, matches zero commands, or matches more than one.
+fn hint_for_line(commands: &[String], line: &str) -> Option<String> {
+    if !line.starts_with('/') || line.contains(char::is_whitespace) {
+        return None;
+    }
+
+    let mut matches = commands.iter().filter(|cmd| cmd.starts_with(line));
+    let matched = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+
+    matched
+        .strip_prefix(line)
+        .filter(|remainder| !remainder.is_empty())
+        .map(|remainder| remainder.to_string())
+}
+
+/// The byte length of the line's first word, if that word is a known command.
+fn highlighted_command_span(commands: &[String], line: &str) -> Option<usize> {
+    if !line.starts_with('/') {
+        return None;
+    }
+
+    let first_word = line.split_whitespace().next().unwrap_or(line);
+    commands
+        .iter()
+        .any(|cmd| cmd == first_word)
+        .then_some(first_word.len())
+}
+
 impl Completer for GooseCompleter {
     type Candidate = Pair;
 
@@ -531,7 +570,9 @@ impl Hinter for GooseCompleter {
         }
 
         if !line.is_empty() {
-            return None;
+            drop(cache);
+            let commands = self.known_commands();
+            return hint_for_line(&commands, line);
         }
 
         match cache.hint_status {
@@ -565,11 +606,19 @@ impl Highlighter for GooseCompleter {
     }
 
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
-        Cow::Borrowed(line)
+        let commands = self.known_commands();
+        match highlighted_command_span(&commands, line) {
+            Some(len) => {
+                let (command, rest) = line.split_at(len);
+                let styled = console::Style::new().cyan().apply_to(command);
+                Cow::Owned(format!("{styled}{rest}"))
+            }
+            None => Cow::Borrowed(line),
+        }
     }
 
-    fn highlight_char(&self, _line: &str, _pos: usize, _cmd_kind: CmdKind) -> bool {
-        false
+    fn highlight_char(&self, line: &str, _pos: usize, _cmd_kind: CmdKind) -> bool {
+        line.starts_with('/')
     }
 }
 
@@ -969,5 +1018,85 @@ mod tests {
             .complete_argument_keys("/prompt nonexistent")
             .unwrap();
         assert_eq!(candidates.len(), 0);
+    }
+
+    #[test]
+    fn test_known_commands_includes_builtin_and_custom() {
+        let cache = create_test_cache();
+        let completer = GooseCompleter::new(cache);
+
+        let commands = completer.known_commands();
+        assert!(commands.iter().any(|c| c == "/exit"));
+        assert!(commands.iter().any(|c| c == "/feature-design"));
+    }
+
+    #[test]
+    fn test_hint_for_line_unambiguous_prefix_returns_remainder() {
+        let cache = create_test_cache();
+        let completer = GooseCompleter::new(cache);
+        let commands = completer.known_commands();
+
+        assert_eq!(
+            hint_for_line(&commands, "/doc"),
+            Some("tor".to_string()),
+            "/doc should uniquely match /doctor"
+        );
+    }
+
+    #[test]
+    fn test_hint_for_line_ambiguous_prefix_returns_none() {
+        let cache = create_test_cache();
+        let completer = GooseCompleter::new(cache);
+        let commands = completer.known_commands();
+
+        assert_eq!(
+            hint_for_line(&commands, "/g"),
+            None,
+            "/g matches both /goal and /grind"
+        );
+    }
+
+    #[test]
+    fn test_hint_for_line_no_match_returns_none() {
+        let cache = create_test_cache();
+        let completer = GooseCompleter::new(cache);
+        let commands = completer.known_commands();
+
+        assert_eq!(hint_for_line(&commands, "/nonexistent"), None);
+    }
+
+    #[test]
+    fn test_hint_for_line_with_whitespace_returns_none() {
+        let cache = create_test_cache();
+        let completer = GooseCompleter::new(cache);
+        let commands = completer.known_commands();
+
+        assert_eq!(hint_for_line(&commands, "/exit "), None);
+    }
+
+    #[test]
+    fn test_highlighted_command_span_known_command() {
+        let cache = create_test_cache();
+        let completer = GooseCompleter::new(cache);
+        let commands = completer.known_commands();
+
+        assert_eq!(
+            highlighted_command_span(&commands, "/exit"),
+            Some("/exit".len())
+        );
+        assert_eq!(
+            highlighted_command_span(&commands, "/exit now"),
+            Some("/exit".len())
+        );
+    }
+
+    #[test]
+    fn test_highlighted_command_span_unknown_command() {
+        let cache = create_test_cache();
+        let completer = GooseCompleter::new(cache);
+        let commands = completer.known_commands();
+
+        assert_eq!(highlighted_command_span(&commands, "/nonexistent"), None);
+        assert_eq!(highlighted_command_span(&commands, "plain text"), None);
     }
 }
