@@ -245,11 +245,19 @@ impl GooseCompleter {
             "/model".to_string(),
             "/recipe".to_string(),
         ];
-        commands.extend(
-            list_commands()
-                .iter()
-                .map(|command| format!("/{}", command.name)),
-        );
+
+        let cache = self.completion_cache.read().unwrap();
+        if cache.slash_commands.is_empty() {
+            commands.extend(
+                list_commands()
+                    .iter()
+                    .map(|command| format!("/{}", command.name)),
+            );
+        } else {
+            commands.extend(cache.slash_commands.iter().map(|name| format!("/{name}")));
+        }
+        drop(cache);
+
         commands.sort();
         commands.dedup();
 
@@ -654,6 +662,12 @@ mod tests {
             .provider_models
             .insert("zai".to_string(), vec!["glm-4.5".to_string()]);
 
+        cache.slash_commands = list_commands()
+            .iter()
+            .map(|command| command.name.to_string())
+            .chain(std::iter::once("feature-design".to_string()))
+            .collect();
+
         Arc::new(RwLock::new(cache))
     }
 
@@ -692,6 +706,72 @@ mod tests {
         // Test no match
         let (_pos, candidates) = completer.complete_slash_commands("/nonexistent").unwrap();
         assert_eq!(candidates.len(), 0);
+    }
+
+    #[test]
+    fn test_complete_slash_commands_includes_custom_command() {
+        let cache = create_test_cache();
+        let completer = GooseCompleter::new(cache);
+
+        let (pos, candidates) = completer.complete_slash_commands("/f").unwrap();
+        assert_eq!(pos, 0);
+        assert!(candidates.iter().any(|c| c.display == "/feature-design"));
+    }
+
+    #[test]
+    fn test_complete_slash_commands_keeps_builtins_and_cli_only_commands() {
+        let cache = create_test_cache();
+        let completer = GooseCompleter::new(cache);
+
+        let (_pos, candidates) = completer.complete_slash_commands("/").unwrap();
+        for command in list_commands() {
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.display == format!("/{}", command.name)),
+                "slash completion should list /{}",
+                command.name
+            );
+        }
+
+        let cli_only_commands = [
+            "/exit",
+            "/quit",
+            "/help",
+            "/?",
+            "/t",
+            "/extension",
+            "/builtin",
+            "/mode",
+            "/model",
+            "/recipe",
+        ];
+        for cli_only in cli_only_commands {
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.display == cli_only),
+                "slash completion should list {cli_only}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_complete_slash_commands_falls_back_to_builtins_when_cache_empty() {
+        let cache = create_test_cache();
+        cache.write().unwrap().slash_commands.clear();
+        let completer = GooseCompleter::new(cache);
+
+        let (_pos, candidates) = completer.complete_slash_commands("/").unwrap();
+        for command in list_commands() {
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.display == format!("/{}", command.name)),
+                "fallback slash completion should list /{}",
+                command.name
+            );
+        }
     }
 
     #[test]
