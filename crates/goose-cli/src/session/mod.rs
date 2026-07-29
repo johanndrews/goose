@@ -1097,13 +1097,16 @@ impl CliSession {
             }
         };
 
-        let target_id = match resolve_resume_target(&sessions, &self.session_id, target.as_deref())
-        {
-            Ok(id) => id,
-            Err(ResumeError::NoOtherSession) => {
-                output::render_error("No other session to resume.");
+        let target = match target {
+            Some(target) => target,
+            None => {
+                self.render_resumable_sessions(&sessions);
                 return Ok(());
             }
+        };
+
+        let target_id = match resolve_resume_target(&sessions, &target) {
+            Ok(id) => id,
             Err(ResumeError::NotFound(target)) => {
                 output::render_error(&format!("No session found matching '{}'.", target));
                 return Ok(());
@@ -1112,6 +1115,50 @@ impl CliSession {
 
         self.switch_to_session(SessionTarget::Existing(target_id))
             .await
+    }
+
+    /// Lists the most recently active sessions `/resume` (without an argument) can switch to,
+    /// marking the current one instead of switching blindly to the most recent other session.
+    fn render_resumable_sessions(&self, sessions: &[goose::session::Session]) {
+        use comfy_table::{presets, Cell, ContentArrangement, Table};
+
+        if sessions.iter().all(|s| s.id == self.session_id) {
+            println!(
+                "{}",
+                console::style("No other sessions to resume.").yellow()
+            );
+            return;
+        }
+
+        let mut table = Table::new();
+        table.set_content_arrangement(ContentArrangement::Dynamic);
+        table.load_preset(presets::ASCII_FULL);
+        table.set_header(vec!["Session ID", "Name", "Last active", "Messages"]);
+
+        for session in sessions.iter().take(RESUME_LIST_LIMIT) {
+            let last_active = session
+                .last_message_at
+                .unwrap_or(session.updated_at)
+                .format("%Y-%m-%d %H:%M")
+                .to_string();
+            let name = if session.id == self.session_id {
+                format!("{} (current)", session.name)
+            } else {
+                session.name.clone()
+            };
+            table.add_row(vec![
+                Cell::new(&session.id),
+                Cell::new(name),
+                Cell::new(last_active),
+                Cell::new(session.message_count),
+            ]);
+        }
+
+        println!("{table}");
+        println!(
+            "{}",
+            console::style("Use '/resume <id|name>' to switch to a session.").dim()
+        );
     }
 
     async fn switch_to_session(&mut self, target: SessionTarget) -> Result<()> {
@@ -2142,33 +2189,23 @@ enum SessionTarget {
 
 #[derive(Debug, PartialEq, Eq)]
 enum ResumeError {
-    NoOtherSession,
     NotFound(String),
 }
 
-/// Resolve which session `/resume` should switch to.
-///
-/// With no `requested` target, picks the newest session other than `current_id` from
-/// `sessions` (expected newest-first, as returned by `list_sessions_by_types`). With a
-/// `requested` target, matches by id first, then by exact name.
+const RESUME_LIST_LIMIT: usize = 10;
+
+/// Resolve which session an explicit `/resume <target>` argument refers to: matches by id
+/// first, then by exact name.
 fn resolve_resume_target(
     sessions: &[goose::session::Session],
-    current_id: &str,
-    requested: Option<&str>,
+    requested: &str,
 ) -> Result<String, ResumeError> {
-    match requested {
-        Some(target) => sessions
-            .iter()
-            .find(|s| s.id == target)
-            .or_else(|| sessions.iter().find(|s| s.name == target))
-            .map(|s| s.id.clone())
-            .ok_or_else(|| ResumeError::NotFound(target.to_string())),
-        None => sessions
-            .iter()
-            .find(|s| s.id != current_id)
-            .map(|s| s.id.clone())
-            .ok_or(ResumeError::NoOtherSession),
-    }
+    sessions
+        .iter()
+        .find(|s| s.id == requested)
+        .or_else(|| sessions.iter().find(|s| s.name == requested))
+        .map(|s| s.id.clone())
+        .ok_or_else(|| ResumeError::NotFound(requested.to_string()))
 }
 
 async fn create_successor_session(
@@ -3169,35 +3206,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_resume_target_picks_newest_other_session_without_argument() {
-        // Newest-first, as `list_sessions_by_types` returns it. The current session sits
-        // in the middle, so a naive "skip the first entry" implementation would still pass
-        // this one - the dedicated test below closes that gap.
-        let sessions = vec![
-            test_session("newest", "Newest"),
-            test_session("current", "Current"),
-            test_session("oldest", "Oldest"),
-        ];
-
-        let result = resolve_resume_target(&sessions, "current", None);
-
-        assert_eq!(result, Ok("newest".to_string()));
-    }
-
-    #[test]
-    fn resolve_resume_target_never_returns_current_session() {
-        // The current session is the newest (first) entry - it must still be skipped.
-        let sessions = vec![
-            test_session("current", "Current"),
-            test_session("second", "Second"),
-        ];
-
-        let result = resolve_resume_target(&sessions, "current", None);
-
-        assert_eq!(result, Ok("second".to_string()));
-    }
-
-    #[test]
     fn resolve_resume_target_matches_by_id() {
         let sessions = vec![
             test_session("newest", "Newest"),
@@ -3205,7 +3213,7 @@ mod tests {
             test_session("target-id", "Some Name"),
         ];
 
-        let result = resolve_resume_target(&sessions, "current", Some("target-id"));
+        let result = resolve_resume_target(&sessions, "target-id");
 
         assert_eq!(result, Ok("target-id".to_string()));
     }
@@ -3218,7 +3226,7 @@ mod tests {
             test_session("target-id", "my-session"),
         ];
 
-        let result = resolve_resume_target(&sessions, "current", Some("my-session"));
+        let result = resolve_resume_target(&sessions, "my-session");
 
         assert_eq!(result, Ok("target-id".to_string()));
     }
@@ -3230,25 +3238,11 @@ mod tests {
             test_session("current", "Current"),
         ];
 
-        let result = resolve_resume_target(&sessions, "current", Some("nonexistent"));
+        let result = resolve_resume_target(&sessions, "nonexistent");
 
         assert_eq!(
             result,
             Err(ResumeError::NotFound("nonexistent".to_string()))
         );
-    }
-
-    #[test]
-    fn resolve_resume_target_reports_no_other_session() {
-        let sessions = vec![test_session("current", "Current")];
-
-        let result = resolve_resume_target(&sessions, "current", None);
-
-        assert_eq!(result, Err(ResumeError::NoOtherSession));
-
-        let empty: Vec<goose::session::Session> = vec![];
-        let result = resolve_resume_target(&empty, "current", None);
-
-        assert_eq!(result, Err(ResumeError::NoOtherSession));
     }
 }

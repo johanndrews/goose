@@ -508,7 +508,7 @@ fn help_text() -> String {
 /clear - Clears the current chat history
 /new - Start a fresh session in this process, keeping the current provider, model and extensions
 /resume [name-or-id] - Switch to an earlier session without restarting, keeping the current provider, model and extensions.
-                        With no argument, switches to the most recently updated other session.
+                        With no argument, lists the most recently active sessions to switch to.
 
 Navigation:
 Enter - Send message
