@@ -1688,14 +1688,12 @@ pub fn display_context_usage(
 
     match name_slot {
         SessionNameSlot::Hidden => emit(&left),
-        SessionNameSlot::Shown { padding, name } => {
-            emit(&format!(
-                "{}{}{}",
-                left,
-                " ".repeat(padding),
-                style(name).dim()
-            ))
-        }
+        SessionNameSlot::Shown { padding, name } => emit(&format!(
+            "{}{}{}",
+            left,
+            " ".repeat(padding),
+            style(name).dim()
+        )),
     }
 }
 
