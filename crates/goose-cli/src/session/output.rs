@@ -1028,14 +1028,16 @@ fn print_markdown(content: &str, theme: Theme) {
 
 /// Renders markdown content using bat (no table processing)
 fn print_markdown_raw(content: &str, theme: Theme) {
+    let mut rendered = String::new();
     bat::PrettyPrinter::new()
         .input(bat::Input::from_bytes(content.as_bytes()))
         .theme(theme.as_str())
         .colored_output(env_no_color())
         .language("Markdown")
         .wrapping_mode(WrappingMode::NoWrapping(true))
-        .print()
+        .print_with_writer(Some(&mut rendered))
         .unwrap();
+    emit_raw(&rendered);
 }
 
 fn extract_markdown_table(content: &str) -> Option<(String, Vec<&str>, &str)> {
