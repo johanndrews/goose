@@ -383,6 +383,31 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
                 Some(InputResult::Edit(Some(prefill.to_string())))
             }
         }
+        _ => match command_arguments(input) {
+            Some(arguments) => {
+                println!(
+                    "{}",
+                    console::style(format!("Usage: {input} {arguments}")).yellow()
+                );
+                Some(InputResult::Retry)
+            }
+            None => None,
+        },
+    }
+}
+
+/// What a command expects after its name, for the commands that do nothing
+/// without it. Used both to hint while typing and to answer a bare one.
+///
+/// Only exact command words get an answer. Anything else keeps falling through
+/// to the agent, which is not laziness: the agent runs slash commands of its
+/// own (`/goal`, `/grind`, `/status`, see `agents::execute_commands`), and a
+/// line like `/etc/hosts is wrong` is a sentence, not a command.
+pub(super) fn command_arguments(command: &str) -> Option<String> {
+    match command {
+        "/mode" => Some(format!("<{}>", GooseMode::VARIANTS.join("|"))),
+        "/extension" => Some("<ENV1=val1 command args...>".to_string()),
+        "/builtin" => Some("<name>[,<name>...]".to_string()),
         _ => None,
     }
 }
@@ -568,6 +593,54 @@ fn print_editor_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bare_command_that_needs_an_argument_reports_its_usage() {
+        assert!(matches!(
+            handle_slash_command("/mode"),
+            Some(InputResult::Retry)
+        ));
+        assert!(matches!(
+            handle_slash_command("/extension"),
+            Some(InputResult::Retry)
+        ));
+        assert!(matches!(
+            handle_slash_command("/builtin"),
+            Some(InputResult::Retry)
+        ));
+    }
+
+    #[test]
+    fn the_same_command_with_an_argument_still_runs() {
+        assert!(matches!(
+            handle_slash_command("/mode auto"),
+            Some(InputResult::GooseMode(mode)) if mode == "auto"
+        ));
+        assert!(matches!(
+            handle_slash_command("/builtin developer"),
+            Some(InputResult::AddBuiltin(names)) if names == "developer"
+        ));
+    }
+
+    /// The agent runs slash commands of its own, and it only ever sees them
+    /// because unknown ones are passed through as text. Guarding a bare command
+    /// must not cost that.
+    #[test]
+    fn commands_the_cli_does_not_know_still_reach_the_agent() {
+        assert!(handle_slash_command("/goal ship the fix").is_none());
+        assert!(handle_slash_command("/grind").is_none());
+        assert!(handle_slash_command("/status").is_none());
+        assert!(handle_slash_command("/etc/hosts looks wrong").is_none());
+        assert!(handle_slash_command("/modeless").is_none());
+    }
+
+    #[test]
+    fn command_arguments_only_answers_for_commands_that_need_them() {
+        assert!(command_arguments("/mode").is_some());
+        assert!(command_arguments("/compact").is_none());
+        assert!(command_arguments("/mode auto").is_none());
+        assert!(command_arguments("hello").is_none());
+    }
 
     #[test]
     fn test_handle_slash_command() {

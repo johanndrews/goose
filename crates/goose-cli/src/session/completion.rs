@@ -565,6 +565,21 @@ impl Completer for GooseCompleter {
 // Implement the Helper trait which is required by rustyline
 impl Helper for GooseCompleter {}
 
+/// Shows what a command expects while its name is being typed, so the argument
+/// it needs is visible before Enter rather than after.
+fn usage_hint(line: &str) -> Option<String> {
+    let command = line.trim_end();
+    if command.contains(char::is_whitespace) {
+        return None;
+    }
+    let arguments = super::input::command_arguments(command)?;
+    Some(if line.ends_with(' ') {
+        arguments
+    } else {
+        format!(" {arguments}")
+    })
+}
+
 // Implement required traits with default implementations
 impl Hinter for GooseCompleter {
     type Hint = String;
@@ -582,7 +597,9 @@ impl Hinter for GooseCompleter {
         if !line.is_empty() {
             drop(cache);
             let commands = self.known_commands();
-            return hint_for_line(&commands, line);
+            // Completing the name comes first; once it is complete there is
+            // nothing left to suggest, and the arguments take over.
+            return hint_for_line(&commands, line).or_else(|| usage_hint(line));
         }
 
         match cache.hint_status {
@@ -648,6 +665,19 @@ mod tests {
     use super::*;
     use crate::session::output;
     use std::sync::{Arc, RwLock};
+
+    #[test]
+    fn usage_hint_shows_the_arguments_a_command_expects() {
+        assert!(usage_hint("/mode").unwrap().starts_with(" <"));
+        assert!(!usage_hint("/mode ").unwrap().starts_with(' '));
+    }
+
+    #[test]
+    fn usage_hint_stays_quiet_once_an_argument_is_there() {
+        assert_eq!(usage_hint("/mode auto"), None);
+        assert_eq!(usage_hint("/compact"), None);
+        assert_eq!(usage_hint("what is a mode"), None);
+    }
 
     // Helper function to create a test completion cache
     fn create_test_cache() -> Arc<RwLock<CompletionCache>> {
