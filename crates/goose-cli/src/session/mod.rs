@@ -586,8 +586,7 @@ impl CliSession {
     fn create_editor(
         &self,
     ) -> Result<rustyline::Editor<GooseCompleter, rustyline::history::DefaultHistory>> {
-        let builder =
-            rustyline::Config::builder().completion_type(rustyline::CompletionType::Circular);
+        let builder = rustyline::Config::builder().completion_type(completion_type());
         let builder = match self.edit_mode {
             Some(mode) => builder.edit_mode(mode),
             None => builder.edit_mode(EditMode::Emacs),
@@ -2263,6 +2262,25 @@ async fn create_successor_session(
     Ok(new_session.id)
 }
 
+/// Tab either cycles through the candidates silently (`circular`, the default)
+/// or prints them as a list (`list`). Kept configurable rather than switched
+/// outright, because it changes what every existing session does on Tab.
+fn completion_type() -> rustyline::CompletionType {
+    completion_type_from(
+        Config::global()
+            .get_param::<String>("GOOSE_CLI_COMPLETION_MENU")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn completion_type_from(setting: Option<&str>) -> rustyline::CompletionType {
+    match setting.map(str::trim) {
+        Some(value) if value.eq_ignore_ascii_case("list") => rustyline::CompletionType::List,
+        _ => rustyline::CompletionType::Circular,
+    }
+}
+
 fn message_has_text(message: &Message) -> bool {
     message.content.iter().any(
         |content| matches!(content, MessageContent::Text(text) if !text.text.trim().is_empty()),
@@ -2827,6 +2845,38 @@ fn build_switched_model_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_menu_defaults_to_circular() {
+        assert!(matches!(
+            completion_type_from(None),
+            rustyline::CompletionType::Circular
+        ));
+        assert!(matches!(
+            completion_type_from(Some("circular")),
+            rustyline::CompletionType::Circular
+        ));
+        assert!(
+            matches!(
+                completion_type_from(Some("nonsense")),
+                rustyline::CompletionType::Circular
+            ),
+            "an unrecognised value must not silently change Tab behaviour"
+        );
+    }
+
+    #[test]
+    fn completion_menu_list_opts_into_the_menu() {
+        assert!(matches!(
+            completion_type_from(Some("list")),
+            rustyline::CompletionType::List
+        ));
+        assert!(matches!(
+            completion_type_from(Some("  LIST  ")),
+            rustyline::CompletionType::List
+        ));
+    }
+
     use goose::agents::extension::Envs;
     use goose::config::ExtensionConfig;
     use std::collections::HashMap;
