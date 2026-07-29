@@ -242,6 +242,7 @@ impl GooseCompleter {
             "/t".to_string(),
             "/extension".to_string(),
             "/builtin".to_string(),
+            "/extensions".to_string(),
             "/mode".to_string(),
             "/model".to_string(),
             "/recipe".to_string(),
@@ -756,6 +757,11 @@ mod tests {
         // Test no match
         let (_pos, candidates) = completer.complete_slash_commands("/nonexistent").unwrap();
         assert_eq!(candidates.len(), 0);
+
+        // Test /extensions is offered for autocomplete
+        let (pos, candidates) = completer.complete_slash_commands("/extensions").unwrap();
+        assert_eq!(pos, 0);
+        assert!(candidates.iter().any(|c| c.display == "/extensions"));
     }
 
     #[test]

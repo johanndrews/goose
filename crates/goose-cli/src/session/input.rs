@@ -34,6 +34,7 @@ pub enum InputResult {
     Edit(Option<String>),
     ListSkills,
     LoadSkills(Vec<String>),
+    ListExtensions,
 }
 
 #[derive(Debug)]
@@ -247,6 +248,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_EDIT: &str = "/edit";
     const CMD_EDIT_WITH_SPACE: &str = "/edit ";
     const CMD_SKILLS: &str = "/skills";
+    const CMD_EXTENSIONS: &str = "/extensions";
 
     match input {
         "/exit" | "/quit" => Some(InputResult::Exit),
@@ -350,6 +352,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
                 Some(InputResult::LoadSkills(names))
             }
         }
+        s if s == CMD_EXTENSIONS => Some(InputResult::ListExtensions),
         s if s == CMD_SUMMARIZE_DEPRECATED => {
             println!("{}", console::style("⚠️  Note: /summarize has been renamed to /compact and will be removed in a future release.").yellow());
             Some(InputResult::Compact)
@@ -493,6 +496,7 @@ fn help_text() -> String {
 /edit [text] - Open your prompt editor to compose a message. Optionally pre-fill with text.
                Uses $GOOSE_PROMPT_EDITOR, $VISUAL, or $EDITOR (in that order).
 /skills - List available skills or enable skills by name (usage: /skills [<name>...])
+/extensions - List currently loaded extensions
 /? or /help - Display this help message
 /clear - Clears the current chat history
 /new - Start a fresh session in this process, keeping the current provider, model and extensions
@@ -973,6 +977,18 @@ mod tests {
         assert!(matches!(
             handle_slash_command("/skills   "),
             Some(InputResult::ListSkills)
+        ));
+
+        // Test /extensions: ListExtensions
+        assert!(matches!(
+            handle_slash_command("/extensions"),
+            Some(InputResult::ListExtensions)
+        ));
+
+        // Test /extensions does not accept arguments
+        assert!(!matches!(
+            handle_slash_command("/extensions foo"),
+            Some(InputResult::ListExtensions)
         ));
     }
 }
