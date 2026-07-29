@@ -1616,7 +1616,9 @@ impl CliSession {
                 cost_usd,
             });
         } else {
-            println!();
+            // The reader still holds the terminal here, so this goes through
+            // the emitter like the rest of the turn's output.
+            output::render_blank_line();
             if self.stats {
                 print_run_stats(run_started, first_token_at, last_usage.as_ref());
             }
