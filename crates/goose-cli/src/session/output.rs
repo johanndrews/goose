@@ -1414,25 +1414,22 @@ fn print_params(value: &Option<JsonObject>, depth: usize, debug: bool) {
     }
 }
 
+pub(crate) fn path_with_tilde(path: &Path) -> String {
+    if let Ok(home) = etcetera::home_dir() {
+        if let Ok(stripped) = path.strip_prefix(home) {
+            return format!("~/{}", stripped.display());
+        }
+    }
+    path.display().to_string()
+}
+
 fn shorten_path(path: &str, debug: bool) -> String {
     // In debug mode, return the full path
     if debug {
         return path.to_string();
     }
 
-    let path = Path::new(path);
-
-    // First try to convert to ~ if it's in home directory
-    let home = etcetera::home_dir().ok();
-    let path_str = if let Some(home) = home {
-        if let Ok(stripped) = path.strip_prefix(home) {
-            format!("~/{}", stripped.display())
-        } else {
-            path.display().to_string()
-        }
-    } else {
-        path.display().to_string()
-    };
+    let path_str = path_with_tilde(Path::new(path));
 
     // If path is already short enough, return as is
     if path_str.len() <= 60 {
