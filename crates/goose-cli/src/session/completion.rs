@@ -247,6 +247,7 @@ impl GooseCompleter {
             "/model".to_string(),
             "/recipe".to_string(),
             "/new".to_string(),
+            "/resume".to_string(),
         ];
 
         let cache = self.completion_cache.read().unwrap();
@@ -840,6 +841,18 @@ mod tests {
                 command.name
             );
         }
+    }
+
+    #[test]
+    fn test_complete_slash_commands_resume() {
+        let cache = create_test_cache();
+        let completer = GooseCompleter::new(cache);
+
+        let (pos, candidates) = completer.complete_slash_commands("/resume").unwrap();
+        assert_eq!(pos, 0);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display, "/resume");
+        assert_eq!(candidates[0].replacement, "/resume ");
     }
 
     #[test]

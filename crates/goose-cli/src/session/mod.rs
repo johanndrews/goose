@@ -671,6 +671,10 @@ impl CliSession {
                 history.save(editor);
                 self.handle_new().await?;
             }
+            InputResult::Resume(target) => {
+                history.save(editor);
+                self.handle_resume(target).await?;
+            }
             InputResult::PromptCommand(opts) => {
                 history.save(editor);
                 self.handle_prompt_command(opts).await?;
@@ -1081,20 +1085,80 @@ impl CliSession {
     }
 
     async fn handle_new(&mut self) -> Result<()> {
+        self.switch_to_session(SessionTarget::New).await
+    }
+
+    async fn handle_resume(&mut self, target: Option<String>) -> Result<()> {
+        let sessions = match self
+            .agent
+            .config
+            .session_manager
+            .list_sessions_by_types(&[goose::session::SessionType::User])
+            .await
+        {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                output::render_error(&format!("Failed to list sessions: {}", e));
+                return Ok(());
+            }
+        };
+
+        let target_id = match resolve_resume_target(&sessions, &self.session_id, target.as_deref())
+        {
+            Ok(id) => id,
+            Err(ResumeError::NoOtherSession) => {
+                output::render_error("No other session to resume.");
+                return Ok(());
+            }
+            Err(ResumeError::NotFound(target)) => {
+                output::render_error(&format!("No session found matching '{}'.", target));
+                return Ok(());
+            }
+        };
+
+        self.switch_to_session(SessionTarget::Existing(target_id))
+            .await
+    }
+
+    async fn switch_to_session(&mut self, target: SessionTarget) -> Result<()> {
+        let is_new = matches!(target, SessionTarget::New);
+        let action = if is_new {
+            "Starting a new session"
+        } else {
+            "Resuming a session"
+        };
+
         let provider = self.agent.provider().await?;
         if provider.manages_own_context() {
             output::render_error(&format!(
-                "Starting a new session is not supported for provider '{}' because it manages its own conversation context.",
+                "{action} is not supported for provider '{}' because it manages its own conversation context.",
                 provider.get_name()
             ));
             return Ok(());
         }
 
-        let new_session_id = match self.prepare_successor_session().await {
-            Ok(id) => id,
-            Err(e) => {
-                output::render_error(&format!("Failed to start a new session: {}", e));
-                return Ok(());
+        let (new_session_id, new_messages) = match target {
+            SessionTarget::New => match self.prepare_successor_session().await {
+                Ok(id) => (id, Conversation::default()),
+                Err(e) => {
+                    output::render_error(&format!("Failed to start a new session: {}", e));
+                    return Ok(());
+                }
+            },
+            SessionTarget::Existing(id) => {
+                match self
+                    .agent
+                    .config
+                    .session_manager
+                    .get_session(&id, true)
+                    .await
+                {
+                    Ok(session) => (id, session.conversation.unwrap_or_default()),
+                    Err(e) => {
+                        output::render_error(&format!("Failed to resume session '{}': {}", id, e));
+                        return Ok(());
+                    }
+                }
             }
         };
 
@@ -1107,7 +1171,7 @@ impl CliSession {
         self.agent.discard_pending_steers(&self.session_id).await;
 
         self.session_id = new_session_id;
-        self.messages.clear();
+        self.messages = new_messages;
         self.run_mode = RunMode::Normal;
         self.agent.set_goal(None).await;
         self.agent.set_grind(None).await;
@@ -1121,7 +1185,8 @@ impl CliSession {
         }
 
         if !extension_configs.is_empty() {
-            output::goose_mode_message("Restarting extensions for the new session...");
+            let verb = if is_new { "new" } else { "resumed" };
+            output::goose_mode_message(&format!("Restarting extensions for the {verb} session..."));
         }
 
         // MCP clients pin themselves to the first session id they see a request for, so
@@ -1145,7 +1210,15 @@ impl CliSession {
             output::render_error(&format!("Failed to refresh completions: {}", e));
         }
 
-        let mut started = format!("Started a new session · {}\n", self.session_id);
+        let mut started = if is_new {
+            format!("Started a new session · {}\n", self.session_id)
+        } else {
+            format!(
+                "Resumed session · {} ({} messages)\n",
+                self.session_id,
+                self.messages.len()
+            )
+        };
         if !unavailable.is_empty() {
             started.push_str(&format!(
                 "Continuing without these extensions: {}\n",
@@ -2117,6 +2190,42 @@ impl CliSession {
 
     fn push_message(&mut self, message: Message) {
         self.messages.push(message);
+    }
+}
+
+enum SessionTarget {
+    New,
+    Existing(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeError {
+    NoOtherSession,
+    NotFound(String),
+}
+
+/// Resolve which session `/resume` should switch to.
+///
+/// With no `requested` target, picks the newest session other than `current_id` from
+/// `sessions` (expected newest-first, as returned by `list_sessions_by_types`). With a
+/// `requested` target, matches by id first, then by exact name.
+fn resolve_resume_target(
+    sessions: &[goose::session::Session],
+    current_id: &str,
+    requested: Option<&str>,
+) -> Result<String, ResumeError> {
+    match requested {
+        Some(target) => sessions
+            .iter()
+            .find(|s| s.id == target)
+            .or_else(|| sessions.iter().find(|s| s.name == target))
+            .map(|s| s.id.clone())
+            .ok_or_else(|| ResumeError::NotFound(target.to_string())),
+        None => sessions
+            .iter()
+            .find(|s| s.id != current_id)
+            .map(|s| s.id.clone())
+            .ok_or(ResumeError::NoOtherSession),
     }
 }
 
@@ -3107,5 +3216,97 @@ mod tests {
                 .get_extension_state("test", "v0"),
             Some(&serde_json::json!("marker"))
         );
+    }
+
+    fn test_session(id: &str, name: &str) -> goose::session::Session {
+        goose::session::Session {
+            id: id.to_string(),
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_resume_target_picks_newest_other_session_without_argument() {
+        // Newest-first, as `list_sessions_by_types` returns it. The current session sits
+        // in the middle, so a naive "skip the first entry" implementation would still pass
+        // this one - the dedicated test below closes that gap.
+        let sessions = vec![
+            test_session("newest", "Newest"),
+            test_session("current", "Current"),
+            test_session("oldest", "Oldest"),
+        ];
+
+        let result = resolve_resume_target(&sessions, "current", None);
+
+        assert_eq!(result, Ok("newest".to_string()));
+    }
+
+    #[test]
+    fn resolve_resume_target_never_returns_current_session() {
+        // The current session is the newest (first) entry - it must still be skipped.
+        let sessions = vec![
+            test_session("current", "Current"),
+            test_session("second", "Second"),
+        ];
+
+        let result = resolve_resume_target(&sessions, "current", None);
+
+        assert_eq!(result, Ok("second".to_string()));
+    }
+
+    #[test]
+    fn resolve_resume_target_matches_by_id() {
+        let sessions = vec![
+            test_session("newest", "Newest"),
+            test_session("current", "Current"),
+            test_session("target-id", "Some Name"),
+        ];
+
+        let result = resolve_resume_target(&sessions, "current", Some("target-id"));
+
+        assert_eq!(result, Ok("target-id".to_string()));
+    }
+
+    #[test]
+    fn resolve_resume_target_matches_by_name() {
+        let sessions = vec![
+            test_session("newest", "Newest"),
+            test_session("current", "Current"),
+            test_session("target-id", "my-session"),
+        ];
+
+        let result = resolve_resume_target(&sessions, "current", Some("my-session"));
+
+        assert_eq!(result, Ok("target-id".to_string()));
+    }
+
+    #[test]
+    fn resolve_resume_target_reports_unknown_target() {
+        let sessions = vec![
+            test_session("newest", "Newest"),
+            test_session("current", "Current"),
+        ];
+
+        let result = resolve_resume_target(&sessions, "current", Some("nonexistent"));
+
+        assert_eq!(
+            result,
+            Err(ResumeError::NotFound("nonexistent".to_string()))
+        );
+    }
+
+    #[test]
+    fn resolve_resume_target_reports_no_other_session() {
+        let sessions = vec![test_session("current", "Current")];
+
+        let result = resolve_resume_target(&sessions, "current", None);
+
+        assert_eq!(result, Err(ResumeError::NoOtherSession));
+
+        let empty: Vec<goose::session::Session> = vec![];
+        let result = resolve_resume_target(&empty, "current", None);
+
+        assert_eq!(result, Err(ResumeError::NoOtherSession));
     }
 }
