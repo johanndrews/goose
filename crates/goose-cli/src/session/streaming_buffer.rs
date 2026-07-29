@@ -20,32 +20,72 @@
 //! let remaining = buf.flush();
 //! ```
 
+use goose::config::Config;
 use regex::Regex;
+use serde_json::Value;
 use std::io::Write;
 use std::sync::LazyLock;
 
 const DEFAULT_MAX_CODE_BLOCK_LINES: usize = 50;
 const DEFAULT_TRUNCATED_SHOW_LINES: usize = 20;
 
-/// Parse a line-count env value, rejecting anything that isn't a positive
+/// Parse a line-count config value, rejecting anything that isn't a positive
 /// integer. Zero is invalid because it would hide every non-empty code block
 /// behind a temp-file pointer.
 fn parse_positive_lines(value: &str) -> Option<usize> {
     value.parse::<usize>().ok().filter(|&n| n > 0)
 }
 
+/// Read a truncation setting through `Config::global()`, which checks the
+/// environment first and falls back to `~/.config/goose/config.yaml`.
+///
+/// Returned as a raw `serde_json::Value` rather than a concrete type:
+/// `get_param`'s typed deserializers (`bool`, `String`, ...) are strict and
+/// reject shapes that don't already match exactly, which would silently
+/// break the legacy tolerance for values like `GOOSE_NO_CODE_TRUNCATION=1`
+/// (a JSON number, not a bool). Callers interpret the value themselves.
+fn config_value(key: &str) -> Option<Value> {
+    Config::global().get_param::<Value>(key).ok()
+}
+
+/// Interpret a config value as a boolean, tolerating the historical env-var
+/// convention (`"1"` or case-insensitive `"true"`) alongside native
+/// YAML/JSON booleans and numbers.
+fn parse_tolerant_bool(value: &Value) -> bool {
+    match value {
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_i64() == Some(1),
+        Value::String(s) => s == "1" || s.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// Interpret a config value as a positive line count, accepting both native
+/// numbers (config.yaml) and numeric strings (env vars, or a quoted
+/// config.yaml value).
+fn value_as_positive_lines(value: &Value) -> Option<usize> {
+    match value {
+        Value::Number(n) => n
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|&n| n > 0),
+        Value::String(s) => parse_positive_lines(s),
+        _ => None,
+    }
+}
+
 fn max_code_block_lines() -> Option<usize> {
     static VALUE: LazyLock<Option<usize>> = LazyLock::new(|| {
-        if std::env::var("GOOSE_NO_CODE_TRUNCATION")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-        {
+        let no_truncation = config_value("GOOSE_NO_CODE_TRUNCATION")
+            .as_ref()
+            .is_some_and(parse_tolerant_bool);
+        if no_truncation {
             return None;
         }
         Some(
-            std::env::var("GOOSE_MAX_CODE_BLOCK_LINES")
-                .ok()
-                .and_then(|v| parse_positive_lines(&v))
+            config_value("GOOSE_MAX_CODE_BLOCK_LINES")
+                .as_ref()
+                .and_then(value_as_positive_lines)
                 .unwrap_or(DEFAULT_MAX_CODE_BLOCK_LINES),
         )
     });
@@ -54,9 +94,9 @@ fn max_code_block_lines() -> Option<usize> {
 
 fn truncated_show_lines() -> usize {
     static VALUE: LazyLock<usize> = LazyLock::new(|| {
-        std::env::var("GOOSE_TRUNCATED_SHOW_LINES")
-            .ok()
-            .and_then(|v| parse_positive_lines(&v))
+        config_value("GOOSE_TRUNCATED_SHOW_LINES")
+            .as_ref()
+            .and_then(value_as_positive_lines)
             .unwrap_or(DEFAULT_TRUNCATED_SHOW_LINES)
     });
     *VALUE
@@ -822,5 +862,105 @@ mod tests {
         assert_eq!(parse_positive_lines(""), None);
         assert_eq!(parse_positive_lines("not-a-number"), None);
         assert_eq!(parse_positive_lines("3.14"), None);
+    }
+
+    // ===========================================
+    // Config value interpretation
+    //
+    // These test the pure interpretation helpers directly with hand-built
+    // `serde_json::Value`s. The functions that actually source those values
+    // (`max_code_block_lines`, `truncated_show_lines`) cache their result in
+    // a `LazyLock` the first time either is called in the process, and
+    // `Config::global()` is itself a process-wide singleton - so neither is
+    // reachable for a "does env=X vs config.yaml=Y win" test within a single
+    // test binary: whichever test runs first would permanently decide the
+    // value for every other test. The interpretation logic below is what we
+    // can meaningfully verify in isolation.
+    // ===========================================
+
+    #[test]
+    fn parse_tolerant_bool_accepts_legacy_string_forms() {
+        // The exact strings the old `std::env::var(..).map(|v| v == "1" ||
+        // v.eq_ignore_ascii_case("true"))` accepted.
+        assert!(parse_tolerant_bool(&Value::String("1".to_string())));
+        assert!(parse_tolerant_bool(&Value::String("true".to_string())));
+        assert!(parse_tolerant_bool(&Value::String("TRUE".to_string())));
+        assert!(parse_tolerant_bool(&Value::String("True".to_string())));
+
+        assert!(!parse_tolerant_bool(&Value::String("0".to_string())));
+        assert!(!parse_tolerant_bool(&Value::String("false".to_string())));
+        assert!(!parse_tolerant_bool(&Value::String("yes".to_string())));
+        assert!(!parse_tolerant_bool(&Value::String("2".to_string())));
+        assert!(!parse_tolerant_bool(&Value::String("".to_string())));
+    }
+
+    #[test]
+    fn parse_tolerant_bool_accepts_native_json_yaml_shapes() {
+        // `Config::get_param::<Value>` hands back a native `Bool`/`Number`
+        // (not a `String`) for an unquoted `config.yaml` value, or for an
+        // env var whose text is valid JSON (e.g. `GOOSE_NO_CODE_TRUNCATION=1`
+        // parses as the JSON number 1, not the string "1" - see
+        // `Config::parse_env_value` in crates/goose/src/config/base.rs).
+        assert!(parse_tolerant_bool(&Value::Bool(true)));
+        assert!(!parse_tolerant_bool(&Value::Bool(false)));
+        assert!(parse_tolerant_bool(&Value::from(1)));
+        assert!(!parse_tolerant_bool(&Value::from(0)));
+        assert!(!parse_tolerant_bool(&Value::from(2)));
+        assert!(!parse_tolerant_bool(&Value::from(-1)));
+        assert!(!parse_tolerant_bool(&Value::Null));
+    }
+
+    #[test]
+    fn value_as_positive_lines_interprets_numbers_and_numeric_strings() {
+        assert_eq!(value_as_positive_lines(&Value::from(50)), Some(50));
+        assert_eq!(value_as_positive_lines(&Value::from(1)), Some(1));
+        assert_eq!(value_as_positive_lines(&Value::from(0)), None);
+        assert_eq!(value_as_positive_lines(&Value::from(-1)), None);
+
+        assert_eq!(
+            value_as_positive_lines(&Value::String("50".to_string())),
+            Some(50)
+        );
+        assert_eq!(
+            value_as_positive_lines(&Value::String("0".to_string())),
+            None
+        );
+        assert_eq!(
+            value_as_positive_lines(&Value::String("not-a-number".to_string())),
+            None
+        );
+
+        assert_eq!(value_as_positive_lines(&Value::Bool(true)), None);
+        assert_eq!(value_as_positive_lines(&Value::Null), None);
+    }
+
+    /// Runtime proof (not just source-reading) of the claim that motivates
+    /// `parse_tolerant_bool`/`config_value` existing at all: a plain
+    /// `Config::global().get_param::<bool>(..)` does NOT understand
+    /// `GOOSE_NO_CODE_TRUNCATION=1`, because the env var text "1" parses as a
+    /// JSON number, and `serde_json`'s `bool` deserializer strictly rejects
+    /// non-bool shapes instead of coercing them. Uses invented, unique keys
+    /// so a real `~/.config/goose/config.yaml` on the test machine can't
+    /// interfere; `env_lock` serializes this against every other
+    /// `std::env::var`-touching test in the binary.
+    #[test]
+    fn get_param_bool_rejects_legacy_one_but_accepts_true() {
+        {
+            let _guard = env_lock::lock_env([("GOOSE_STREAMING_BUFFER_TEST_BOOL_ONE", Some("1"))]);
+            let result: Result<bool, _> =
+                Config::global().get_param("GOOSE_STREAMING_BUFFER_TEST_BOOL_ONE");
+            assert!(
+                result.is_err(),
+                "get_param::<bool> unexpectedly accepted \"1\": {result:?}"
+            );
+        }
+
+        {
+            let _guard =
+                env_lock::lock_env([("GOOSE_STREAMING_BUFFER_TEST_BOOL_TRUE", Some("true"))]);
+            let result: Result<bool, _> =
+                Config::global().get_param("GOOSE_STREAMING_BUFFER_TEST_BOOL_TRUE");
+            assert!(result.unwrap());
+        }
     }
 }
