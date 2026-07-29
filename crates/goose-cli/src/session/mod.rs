@@ -1267,6 +1267,13 @@ impl CliSession {
             ));
         }
         output::render_message(&Message::assistant().with_text(started), self.debug);
+
+        // The conversation is in memory either way, but only the terminal makes it
+        // usable for the person at it, so a resumed session replays like `--resume`.
+        if !is_new {
+            self.render_message_history();
+        }
+
         Ok(())
     }
 
