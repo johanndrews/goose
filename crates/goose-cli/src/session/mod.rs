@@ -716,6 +716,10 @@ impl CliSession {
                 history.save(editor);
                 self.handle_list_skills().await?;
             }
+            InputResult::ListExtensions => {
+                history.save(editor);
+                self.handle_list_extensions().await?;
+            }
         }
         Ok(())
     }
@@ -1155,6 +1159,47 @@ impl CliSession {
                 Cell::new(&skill.name),
                 Cell::new(location),
                 Cell::new(&skill.description),
+            ]);
+        }
+
+        println!("{table}");
+        Ok(())
+    }
+
+    async fn handle_list_extensions(&mut self) -> Result<()> {
+        use comfy_table::{presets, Cell, ContentArrangement, Table};
+
+        let extensions = self.agent.get_extension_configs().await;
+
+        if extensions.is_empty() {
+            println!("{}", console::style("No extensions loaded.").yellow());
+            return Ok(());
+        }
+
+        let mut table = Table::new();
+        table.set_content_arrangement(ContentArrangement::Dynamic);
+        table.load_preset(presets::ASCII_FULL);
+        table.set_header(vec!["Extension", "Type", "Description"]);
+
+        let mut sorted_extensions = extensions;
+        sorted_extensions.sort_by_key(|a| a.name());
+
+        for extension in &sorted_extensions {
+            let (extension_type, description) = match extension {
+                ExtensionConfig::Sse { description, .. } => ("sse", description),
+                ExtensionConfig::Stdio { description, .. } => ("stdio", description),
+                ExtensionConfig::Builtin { description, .. } => ("builtin", description),
+                ExtensionConfig::Platform { description, .. } => ("platform", description),
+                ExtensionConfig::StreamableHttp { description, .. } => {
+                    ("streamable_http", description)
+                }
+                ExtensionConfig::Frontend { description, .. } => ("frontend", description),
+                ExtensionConfig::InlinePython { description, .. } => ("inline_python", description),
+            };
+            table.add_row(vec![
+                Cell::new(extension.name()),
+                Cell::new(extension_type),
+                Cell::new(description),
             ]);
         }
 
