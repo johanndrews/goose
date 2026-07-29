@@ -8,6 +8,7 @@ mod output;
 mod paste;
 pub mod streaming_buffer;
 mod thinking;
+mod turn_input;
 
 use goose::conversation::{fix_conversation, Conversation};
 use std::env;
@@ -48,7 +49,7 @@ use goose::session::SessionManager;
 use rustyline::EditMode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -193,6 +194,11 @@ pub struct CliSession {
     retry_config: Option<RetryConfig>,
     output_format: String,
     stats: bool,
+    /// Lines typed while a turn was running, waiting their turn to be sent.
+    queued_input: VecDeque<String>,
+    /// A line that was still being typed when the turn ended; it goes back
+    /// into the editor rather than being lost.
+    unsent_input: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,6 +318,8 @@ impl CliSession {
             retry_config,
             output_format,
             stats,
+            queued_input: VecDeque::new(),
+            unsent_input: String::new(),
         }
     }
 
@@ -566,8 +574,17 @@ impl CliSession {
                 })
                 .collect();
 
-            output::run_status_hook("waiting");
-            let input = input::get_input(&mut editor, Some(&conversation_strings))?;
+            let input = match self.queued_input.pop_front() {
+                Some(line) => {
+                    output::render_sending_queued_input(&line);
+                    input::classify(&line)
+                }
+                None => {
+                    output::run_status_hook("waiting");
+                    let unsent = std::mem::take(&mut self.unsent_input);
+                    input::get_input(&mut editor, Some(&conversation_strings), &unsent)?
+                }
+            };
             if matches!(input, InputResult::Exit) {
                 break;
             }
@@ -755,9 +772,15 @@ impl CliSession {
                 output::run_status_hook("thinking");
                 output::show_thinking();
                 let start_time = Instant::now();
-                self.process_agent_response(true, CancellationToken::default())
-                    .await?;
+                let cancel_token = CancellationToken::new();
+                let _reader =
+                    turn_input::start(cancel_token.clone(), std::mem::take(&mut self.unsent_input));
+                let response = self.process_agent_response(true, cancel_token).await;
                 output::hide_thinking();
+                let typed_during_turn = turn_input::finish();
+                self.queued_input.extend(typed_during_turn.queued);
+                self.unsent_input = typed_during_turn.partial;
+                response?;
 
                 let elapsed = start_time.elapsed();
                 let elapsed_str = format_elapsed_time(elapsed);
@@ -2431,6 +2454,7 @@ fn maybe_open_credits_top_up_url(
         return;
     }
 
+    let _terminal = turn_input::pause_for_prompt();
     let should_open = cliclack::confirm("Open the top-up URL in your browser?")
         .initial_value(false)
         .interact()
@@ -2453,6 +2477,7 @@ fn emit_stream_event(event: &StreamEvent) {
 
 /// Prompt user for tool call confirmation, returns the Permission selected
 fn prompt_tool_confirmation(security_prompt: &Option<String>) -> Result<Permission> {
+    let _terminal = turn_input::pause_for_prompt();
     output::hide_thinking();
 
     let prompt = if let Some(security_message) = security_prompt {

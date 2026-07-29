@@ -364,8 +364,13 @@ fn expand_pastes(line: &str, pastes: &[Paste]) -> String {
 pub(super) fn read_paste_aware_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     paste_state: Arc<std::sync::RwLock<PasteState>>,
+    initial: &str,
 ) -> rustyline::Result<String> {
-    let input = editor.readline("> ")?;
+    let input = if initial.is_empty() {
+        editor.readline("> ")?
+    } else {
+        editor.readline_with_initial("> ", (initial, ""))?
+    };
     let expanded = paste_state
         .read()
         .ok()

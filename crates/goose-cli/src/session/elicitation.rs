@@ -10,6 +10,7 @@ pub struct ElicitationInput {
 }
 
 pub fn collect_elicitation_input(message: &str, schema: &Value) -> io::Result<ElicitationInput> {
+    let _terminal = super::turn_input::pause_for_prompt();
     if !message.is_empty() {
         println!("\n{}", style(message).cyan());
     }

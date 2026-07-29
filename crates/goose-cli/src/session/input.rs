@@ -126,6 +126,7 @@ fn should_use_editor_always(
 pub fn get_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     conversation_messages: Option<&Vec<String>>,
+    unsent: &str,
 ) -> Result<InputResult> {
     let config = Config::global();
     let prompt_editor = config.get_goose_prompt_editor().ok().flatten();
@@ -137,8 +138,11 @@ pub fn get_input(
             if !editor_cmd.is_empty() {
                 let messages = extract_recent_messages(conversation_messages);
                 let message_refs: Vec<&str> = messages.iter().map(|s| s.as_str()).collect();
-                let (message, has_meaningful_content) =
-                    crate::session::editor::get_editor_input(&editor_cmd, &message_refs, None)?;
+                let (message, has_meaningful_content) = crate::session::editor::get_editor_input(
+                    &editor_cmd,
+                    &message_refs,
+                    Some(unsent).filter(|text| !text.is_empty()),
+                )?;
 
                 if has_meaningful_content {
                     editor.add_history_entry(message.as_str())?;
@@ -190,7 +194,7 @@ pub fn get_input(
         rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache))),
     );
 
-    let input = match read_paste_aware_input(editor, paste_state) {
+    let input = match read_paste_aware_input(editor, paste_state, unsent) {
         Ok(text) => text,
         Err(e) => match e {
             rustyline::error::ReadlineError::Interrupted => return Ok(InputResult::Exit),
@@ -204,27 +208,25 @@ pub fn get_input(
         editor.add_history_entry(input.as_str())?;
     }
 
-    // Handle non-slash commands first
+    Ok(classify(&input))
+}
+
+/// Decides what a line of input means. Lines queued while the agent was
+/// working go through here too, so a slash command typed mid-turn still acts
+/// like one.
+pub fn classify(input: &str) -> InputResult {
     if !input.starts_with('/') {
         let trimmed = input.trim();
-        if trimmed.is_empty()
-            || trimmed.eq_ignore_ascii_case("exit")
-            || trimmed.eq_ignore_ascii_case("quit")
-        {
-            return Ok(if trimmed.is_empty() {
-                InputResult::Retry
-            } else {
-                InputResult::Exit
-            });
+        if trimmed.is_empty() {
+            return InputResult::Retry;
         }
-        return Ok(InputResult::Message(trimmed.to_string()));
+        if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
+            return InputResult::Exit;
+        }
+        return InputResult::Message(trimmed.to_string());
     }
 
-    // Handle slash commands
-    match handle_slash_command(&input) {
-        Some(result) => Ok(result),
-        None => Ok(InputResult::Message(input.trim().to_string())),
-    }
+    handle_slash_command(input).unwrap_or_else(|| InputResult::Message(input.trim().to_string()))
 }
 
 fn handle_slash_command(input: &str) -> Option<InputResult> {
