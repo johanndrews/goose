@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::io::{Error, IsTerminal, Write};
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use super::streaming_buffer::MarkdownBuffer;
@@ -28,11 +29,17 @@ pub const DEFAULT_CLI_LIGHT_THEME: &str = "GitHub";
 pub const DEFAULT_CLI_DARK_THEME: &str = "zenburn";
 
 fn emit(line: &str) {
-    println!("{}", line);
+    match super::turn_input::hold_output() {
+        Some(mut hold) => hold.write_line(line),
+        None => println!("{}", line),
+    }
 }
 
 fn emit_raw(text: &str) {
-    print!("{}", text);
+    match super::turn_input::hold_output() {
+        Some(mut hold) => hold.write_raw(text),
+        None => print!("{}", text),
+    }
 }
 
 fn accent<T: Display>(value: T) -> StyledObject<T> {
@@ -185,20 +192,20 @@ pub struct PromptInfo {
     pub extension: Option<String>,
 }
 
-// Global thinking indicator
-thread_local! {
-    static THINKING: RefCell<ThinkingIndicator> = RefCell::new(ThinkingIndicator::default());
-}
+// Global thinking indicator. Shared rather than thread-local: the turn input
+// reader hides it from its own thread when the user starts typing, since the
+// spinner and the prompt would otherwise fight over the same terminal line.
+static THINKING: Mutex<ThinkingIndicator> = Mutex::new(ThinkingIndicator { spinner: None });
 
 pub fn show_thinking() {
     if std::io::stdout().is_terminal() {
-        THINKING.with(|t| t.borrow_mut().show());
+        THINKING.lock().unwrap().show();
     }
 }
 
 pub fn hide_thinking() {
     if std::io::stdout().is_terminal() {
-        THINKING.with(|t| t.borrow_mut().hide());
+        THINKING.lock().unwrap().hide();
     }
 }
 
@@ -231,16 +238,14 @@ pub fn run_status_hook(status: &str) {
 }
 
 pub fn is_showing_thinking() -> bool {
-    THINKING.with(|t| t.borrow().is_shown())
+    THINKING.lock().unwrap().is_shown()
 }
 
 pub fn set_thinking_message(s: &String) {
     if std::io::stdout().is_terminal() {
-        THINKING.with(|t| {
-            if let Some(spinner) = t.borrow_mut().spinner.as_mut() {
-                spinner.set_message(s);
-            }
-        });
+        if let Some(spinner) = THINKING.lock().unwrap().spinner.as_mut() {
+            spinner.set_message(s);
+        }
     }
 }
 
@@ -628,6 +633,12 @@ fn is_file_tool_name(name: &str) -> bool {
 
 pub fn render_error(message: &str) {
     emit(&format!("\n  {} {}\n", danger("error:").bold(), message));
+}
+
+/// Echoes a line that was typed during the previous turn as it is sent, so the
+/// transcript reads the same as if it had been typed at the prompt.
+pub fn render_sending_queued_input(line: &str) {
+    emit(&format!("> {}", line));
 }
 
 pub fn render_prompts(prompts: &HashMap<String, Vec<String>>) {
