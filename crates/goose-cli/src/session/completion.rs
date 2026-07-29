@@ -432,19 +432,17 @@ fn hint_for_line(commands: &[String], line: &str) -> Option<String> {
         return None;
     }
 
+    fn common_prefix(a: &str, b: &str) -> String {
+        a.chars()
+            .zip(b.chars())
+            .take_while(|(x, y)| x == y)
+            .map(|(x, _)| x)
+            .collect()
+    }
+
     let mut matches = commands.iter().filter(|cmd| cmd.starts_with(line));
-    let first = matches.next()?;
-    let shared = matches.fold(first.as_str(), |shared, candidate| {
-        let common = shared
-            .char_indices()
-            .zip(candidate.chars())
-            .take_while(|((_, a), b)| a == b)
-            .count();
-        &shared[..shared
-            .char_indices()
-            .nth(common)
-            .map_or(shared.len(), |(idx, _)| idx)]
-    });
+    let first = matches.next()?.clone();
+    let shared = matches.fold(first, |shared, candidate| common_prefix(&shared, candidate));
 
     shared
         .strip_prefix(line)
