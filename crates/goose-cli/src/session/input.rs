@@ -28,6 +28,7 @@ pub enum InputResult {
     EndPlan,
     Clear,
     New,
+    Resume(Option<String>),
     Recipe(Option<String>),
     Compact,
     ToggleFullToolOutput,
@@ -241,6 +242,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_ENDPLAN: &str = "/endplan";
     const CMD_CLEAR: &str = "/clear";
     const CMD_NEW: &str = "/new";
+    const CMD_RESUME: &str = "/resume";
     const CMD_RECIPE: &str = "/recipe";
     const CMD_COMPACT: &str = "/compact";
     const CMD_SUMMARIZE_DEPRECATED: &str = "/summarize";
@@ -338,6 +340,15 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s == CMD_ENDPLAN => Some(InputResult::EndPlan),
         s if s == CMD_CLEAR => Some(InputResult::Clear),
         s if s == CMD_NEW => Some(InputResult::New),
+        // Match "/resume" exactly or "/resume " with args - avoids matching e.g. "/resumefoo"
+        s if s == CMD_RESUME || s.starts_with(&format!("{CMD_RESUME} ")) => {
+            let target = s.get(CMD_RESUME.len()..).unwrap_or("").trim();
+            if target.is_empty() {
+                Some(InputResult::Resume(None))
+            } else {
+                Some(InputResult::Resume(Some(target.to_string())))
+            }
+        }
         s if s.starts_with(CMD_RECIPE) => parse_recipe_command(s),
         s if s == CMD_COMPACT => Some(InputResult::Compact),
         // Match "/skills" exactly or "/skills " with args - avoids matching e.g. "/skillsextra"
@@ -496,6 +507,8 @@ fn help_text() -> String {
 /? or /help - Display this help message
 /clear - Clears the current chat history
 /new - Start a fresh session in this process, keeping the current provider, model and extensions
+/resume [name-or-id] - Switch to an earlier session without restarting, keeping the current provider, model and extensions.
+                        With no argument, switches to the most recently updated other session.
 
 Navigation:
 Enter - Send message
@@ -677,6 +690,36 @@ mod tests {
             handle_slash_command("/new"),
             Some(InputResult::New)
         ));
+    }
+
+    #[test]
+    fn test_handle_slash_command_resume() {
+        assert!(matches!(
+            handle_slash_command("/resume"),
+            Some(InputResult::Resume(None))
+        ));
+
+        assert!(matches!(
+            handle_slash_command("/resume   "),
+            Some(InputResult::Resume(None))
+        ));
+
+        if let Some(InputResult::Resume(Some(target))) = handle_slash_command("/resume foo") {
+            assert_eq!(target, "foo");
+        } else {
+            panic!("Expected Resume with target");
+        }
+
+        if let Some(InputResult::Resume(Some(target))) =
+            handle_slash_command("  /resume   my-session  ")
+        {
+            assert_eq!(target, "my-session");
+        } else {
+            panic!("Expected Resume with target (whitespace handling)");
+        }
+
+        // "/resumefoo" must not match "/resume"
+        assert!(handle_slash_command("/resumefoo").is_none());
     }
 
     #[test]
