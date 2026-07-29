@@ -424,20 +424,29 @@ impl GooseCompleter {
     }
 }
 
-/// The remainder of the unambiguous command that starts with `line`, or `None` if the line
-/// isn't a bare command prefix, matches zero commands, or matches more than one.
+/// The part every matching command agrees on, so the hint is never a guess:
+/// `/cl` suggests `ea` while `clear` and `clean-code` both match, and only
+/// commits to one of them once the input tells them apart.
 fn hint_for_line(commands: &[String], line: &str) -> Option<String> {
     if !line.starts_with('/') || line.contains(char::is_whitespace) {
         return None;
     }
 
     let mut matches = commands.iter().filter(|cmd| cmd.starts_with(line));
-    let matched = matches.next()?;
-    if matches.next().is_some() {
-        return None;
-    }
+    let first = matches.next()?;
+    let shared = matches.fold(first.as_str(), |shared, candidate| {
+        let common = shared
+            .char_indices()
+            .zip(candidate.chars())
+            .take_while(|((_, a), b)| a == b)
+            .count();
+        &shared[..shared
+            .char_indices()
+            .nth(common)
+            .map_or(shared.len(), |(idx, _)| idx)]
+    });
 
-    matched
+    shared
         .strip_prefix(line)
         .filter(|remainder| !remainder.is_empty())
         .map(|remainder| remainder.to_string())
@@ -1076,7 +1085,22 @@ mod tests {
     }
 
     #[test]
-    fn test_hint_for_line_ambiguous_prefix_returns_none() {
+    fn test_hint_for_line_ambiguous_prefix_returns_shared_part_only() {
+        let commands = vec![
+            "/clear".to_string(),
+            "/clean-code".to_string(),
+            "/compact".to_string(),
+        ];
+
+        assert_eq!(
+            hint_for_line(&commands, "/cl"),
+            Some("ea".to_string()),
+            "/clear and /clean-code agree up to /clea, then diverge at r vs n"
+        );
+    }
+
+    #[test]
+    fn test_hint_for_line_returns_none_when_candidates_diverge_immediately() {
         let cache = create_test_cache();
         let completer = GooseCompleter::new(cache);
         let commands = completer.known_commands();
@@ -1084,7 +1108,7 @@ mod tests {
         assert_eq!(
             hint_for_line(&commands, "/g"),
             None,
-            "/g matches both /goal and /grind"
+            "/goal and /grind diverge right after /g, so there is nothing safe to suggest"
         );
     }
 
