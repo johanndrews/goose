@@ -641,6 +641,10 @@ pub fn render_sending_queued_input(line: &str) {
     emit(&format!("> {}", line));
 }
 
+pub fn render_blank_line() {
+    emit("");
+}
+
 pub fn render_prompts(prompts: &HashMap<String, Vec<String>>) {
     emit("");
     for (extension, prompts) in prompts {
