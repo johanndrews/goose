@@ -1120,8 +1120,6 @@ impl CliSession {
     /// Lists the most recently active sessions `/resume` (without an argument) can switch to,
     /// marking the current one instead of switching blindly to the most recent other session.
     fn render_resumable_sessions(&self, sessions: &[goose::session::Session]) {
-        use comfy_table::{presets, Cell, ContentArrangement, Table};
-
         if sessions.iter().all(|s| s.id == self.session_id) {
             println!(
                 "{}",
@@ -1130,31 +1128,7 @@ impl CliSession {
             return;
         }
 
-        let mut table = Table::new();
-        table.set_content_arrangement(ContentArrangement::Dynamic);
-        table.load_preset(presets::ASCII_FULL);
-        table.set_header(vec!["Session ID", "Name", "Last active", "Messages"]);
-
-        for session in sessions.iter().take(RESUME_LIST_LIMIT) {
-            let last_active = session
-                .last_message_at
-                .unwrap_or(session.updated_at)
-                .format("%Y-%m-%d %H:%M")
-                .to_string();
-            let name = if session.id == self.session_id {
-                format!("{} (current)", session.name)
-            } else {
-                session.name.clone()
-            };
-            table.add_row(vec![
-                Cell::new(&session.id),
-                Cell::new(name),
-                Cell::new(last_active),
-                Cell::new(session.message_count),
-            ]);
-        }
-
-        println!("{table}");
+        println!("{}", resume_table(sessions, &self.session_id));
         println!(
             "{}",
             console::style("Use '/resume <id|name>' to switch to a session.").dim()
@@ -2201,6 +2175,45 @@ enum ResumeError {
 
 const RESUME_LIST_LIMIT: usize = 10;
 
+/// Renders the sessions `/resume` can switch to. The working directory is what tells two
+/// otherwise similar sessions apart, so it sits next to the name rather than at the end.
+fn resume_table(sessions: &[goose::session::Session], current_id: &str) -> comfy_table::Table {
+    use comfy_table::{presets, Cell, ContentArrangement, Table};
+
+    let mut table = Table::new();
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.load_preset(presets::ASCII_FULL);
+    table.set_header(vec![
+        "Session ID",
+        "Name",
+        "Directory",
+        "Last active",
+        "Messages",
+    ]);
+
+    for session in sessions.iter().take(RESUME_LIST_LIMIT) {
+        let last_active = session
+            .last_message_at
+            .unwrap_or(session.updated_at)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+        let name = if session.id == current_id {
+            format!("{} (current)", session.name)
+        } else {
+            session.name.clone()
+        };
+        table.add_row(vec![
+            Cell::new(&session.id),
+            Cell::new(name),
+            Cell::new(output::path_with_tilde(&session.working_dir)),
+            Cell::new(last_active),
+            Cell::new(session.message_count),
+        ]);
+    }
+
+    table
+}
+
 /// Resolve which session an explicit `/resume <target>` argument refers to: matches by id
 /// first, then by exact name.
 fn resolve_resume_target(
@@ -3210,6 +3223,21 @@ mod tests {
             name: name.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn resume_table_shows_the_working_directory_of_each_session() {
+        let mut other = test_session("other-id", "Other");
+        other.working_dir = std::path::PathBuf::from("/tmp/plugin-a");
+        let mut current = test_session("current-id", "Current");
+        current.working_dir = std::path::PathBuf::from("/tmp/plugin-b");
+
+        let rendered = resume_table(&[other, current], "current-id").to_string();
+
+        assert!(rendered.contains("Directory"));
+        assert!(rendered.contains("/tmp/plugin-a"));
+        assert!(rendered.contains("/tmp/plugin-b"));
+        assert!(rendered.contains("Current (current)"));
     }
 
     #[test]
