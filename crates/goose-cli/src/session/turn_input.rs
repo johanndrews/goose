@@ -325,19 +325,10 @@ fn apply_key(state: &mut State, key: KeyEvent) -> Interrupt {
         }
         KeyCode::Enter => {
             let line = std::mem::take(&mut state.line);
-            if line.trim().is_empty() {
-                refresh_prompt(state);
-                return Interrupt::No;
+            if !line.trim().is_empty() {
+                state.queued.push(line);
             }
-            hide_prompt(state);
-            let receipt = format!(
-                "  {}",
-                console::style(format!("⤷ queued: {}", single_line(&line))).dim()
-            );
-            write_output(state, &receipt);
-            write_output(state, "\n");
-            state.queued.push(line);
-            show_prompt(state);
+            refresh_prompt(state);
         }
         _ => {}
     }
@@ -361,7 +352,7 @@ fn write_output(state: &mut State, text: &str) {
 }
 
 fn show_prompt(state: &mut State) {
-    if !state.in_raw || state.line.is_empty() || state.prompt_shown {
+    if !state.in_raw || !has_something_to_show(state) || state.prompt_shown {
         return;
     }
 
@@ -395,7 +386,7 @@ fn hide_prompt(state: &mut State) {
 }
 
 fn refresh_prompt(state: &mut State) {
-    if state.line.is_empty() {
+    if !has_something_to_show(state) {
         hide_prompt(state);
     } else if state.prompt_shown {
         draw_prompt_line(state);
@@ -404,13 +395,30 @@ fn refresh_prompt(state: &mut State) {
     }
 }
 
+/// The prompt stays up while anything is waiting to be sent, so a queued line
+/// is visible where it was typed rather than scrolling away in the output.
+fn has_something_to_show(state: &State) -> bool {
+    !state.line.is_empty() || !state.queued.is_empty()
+}
+
 fn draw_prompt_line(state: &State) {
-    let budget = terminal_width().saturating_sub(PROMPT.len() + 1);
-    write_now(&format!(
-        "\r\x1b[2K{}{}",
-        PROMPT,
-        last_chars(&single_line(&state.line), budget)
-    ));
+    let width = terminal_width();
+    let badge = queue_badge(state.queued.len());
+    let badge_room = badge.as_ref().map_or(0, |b| b.chars().count() + 2);
+    let budget = width.saturating_sub(PROMPT.len() + badge_room + 1);
+    let typed = last_chars(&single_line(&state.line), budget);
+
+    let mut line = format!("\r\x1b[2K{}{}", PROMPT, typed);
+    if let Some(badge) = badge {
+        let used = PROMPT.len() + typed.chars().count() + badge.chars().count();
+        line.push_str(&" ".repeat(width.saturating_sub(used + 1)));
+        line.push_str(&console::style(badge).dim().to_string());
+    }
+    write_now(&line);
+}
+
+fn queue_badge(queued: usize) -> Option<String> {
+    (queued > 0).then(|| format!("⤷ {queued} queued"))
 }
 
 fn terminal_width() -> usize {
@@ -489,6 +497,23 @@ mod tests {
 
         assert_eq!(state.queued, vec!["run the tests".to_string()]);
         assert!(state.line.is_empty());
+    }
+
+    #[test]
+    fn the_prompt_stays_up_for_queued_lines_after_the_buffer_empties() {
+        let mut state = typed("run the tests");
+
+        apply_key(&mut state, press(KeyCode::Enter));
+
+        assert!(state.line.is_empty());
+        assert!(has_something_to_show(&state));
+        assert_eq!(queue_badge(state.queued.len()).unwrap(), "⤷ 1 queued");
+    }
+
+    #[test]
+    fn nothing_typed_and_nothing_queued_shows_no_prompt() {
+        assert!(!has_something_to_show(&State::default()));
+        assert_eq!(queue_badge(0), None);
     }
 
     #[test]
