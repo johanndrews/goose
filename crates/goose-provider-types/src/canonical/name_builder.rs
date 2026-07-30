@@ -54,6 +54,7 @@ pub fn map_provider_name(provider: &str) -> &str {
         "novita" => "novita-ai",
         "opencode_go" => "opencode-go",
         "ollama_cloud" => "ollama-cloud",
+        "kimi_code" => "kimi-for-coding",
         _ => provider,
     }
 }
