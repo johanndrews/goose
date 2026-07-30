@@ -1,0 +1,13 @@
+export declare const PASTE_THRESHOLD = 80;
+export declare const PASTE_PREVIEW_LEN = 40;
+export declare const INPUT_MAX_ROWS = 8;
+export declare const SENT_PREVIEW_LEN = 60;
+export declare const SCROLL_STEP = 3;
+export declare const SCROLL_FAST_MULTIPLIER = 10;
+export declare const CONTEXT_BAR_WIDTH = 20;
+export declare const CONTEXT_WARNING_THRESHOLD = 50;
+export declare const CONTEXT_CRITICAL_THRESHOLD = 85;
+export declare const AUTOCOMPLETE_MAX_VISIBLE = 6;
+export declare const GOOSE_FRAMES: string[][];
+export declare const GREETING_MESSAGES: string[];
+export declare const INITIAL_GREETING: string;
