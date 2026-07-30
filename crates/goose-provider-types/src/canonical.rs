@@ -93,6 +93,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn kimi_code_resolves_through_its_models_dev_name() {
+        // The provider is `kimi_code` in goose and `kimi-for-coding` in the
+        // model database; without the mapping the lookup misses and the model
+        // silently falls back to DEFAULT_CONTEXT_LIMIT.
+        let canonical = maybe_get_canonical_model("kimi_code", "k3")
+            .expect("k3 should resolve for the kimi_code provider");
+        assert_eq!(canonical.limit.context, 1_048_576);
+    }
+
+    #[test]
     fn ollama_models_have_zero_cost() {
         // "mistral-nemo" resolves to mistralai/mistral-nemo which has non-zero cloud pricing.
         // When accessed via ollama, cost must be zeroed out.
