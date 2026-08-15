@@ -2,7 +2,6 @@ mod builder;
 mod completion;
 pub mod editor;
 mod elicitation;
-mod export;
 mod input;
 mod output;
 mod paste;
@@ -10,13 +9,12 @@ pub mod streaming_buffer;
 mod thinking;
 mod turn_input;
 
-use goose::conversation::{fix_conversation, Conversation};
+use goose::conversation::{fix_conversation, merge_consecutive_messages_for_request, Conversation};
 use std::env;
 use std::str::FromStr;
 use tokio::signal::ctrl_c;
 use tokio_util::task::AbortOnDropHandle;
 
-pub use self::export::{message_to_markdown, user_projected_message_to_markdown};
 pub use builder::{build_session, SessionBuilderConfig};
 use console::Color;
 use goose::agents::platform_extensions::developer::shell::{
@@ -35,7 +33,9 @@ use anyhow::{Context, Result};
 use completion::GooseCompleter;
 use goose::agents::extension::{Envs, ExtensionConfig, PLATFORM_EXTENSIONS};
 use goose::agents::types::RetryConfig;
-use goose::agents::{Agent, SessionConfig, COMPACT_TRIGGERS};
+use goose::agents::{
+    context_management_unsupported_message, Agent, SessionConfig, COMPACT_TRIGGERS,
+};
 use goose::config::extensions::name_to_key;
 use goose::config::{Config, GooseMode};
 use input::InputResult;
@@ -67,8 +67,16 @@ const SHELL_STATUS_MAX_LINES: usize = 3;
 const SHELL_STATUS_RESERVED_WIDTH: usize = 2;
 
 fn planner_provider_messages(plan_messages: &Conversation) -> Conversation {
-    let projected_messages = plan_messages.agent_visible_messages();
-    fix_conversation(Conversation::new_unvalidated(projected_messages)).0
+    // The planner prompt has no turn-context instructions; drop the blocks.
+    let projected_messages: Vec<Message> = plan_messages
+        .agent_visible_messages()
+        .into_iter()
+        .filter(|message| !message.is_turn_context())
+        .collect();
+    let fixed = fix_conversation(Conversation::new_unvalidated(projected_messages)).0;
+    Conversation::new_unvalidated(merge_consecutive_messages_for_request(
+        fixed.messages().clone(),
+    ))
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -404,6 +412,9 @@ impl CliSession {
             description: goose::config::DEFAULT_EXTENSION_DESCRIPTION.to_string(),
             timeout: Some(timeout),
             socket: None,
+            client_id: None,
+            client_secret_key: None,
+            scopes: vec![],
             bundled: None,
             available_tools: Vec::new(),
         }
@@ -534,6 +545,14 @@ impl CliSession {
 
     /// Start an interactive session, optionally with an initial message
     pub async fn interactive(&mut self, prompt: Option<String>) -> Result<()> {
+        let banners = self
+            .agent
+            .emit_hook_with_banners(goose::hooks::HookEvent::SessionStart, &self.session_id)
+            .await;
+        if !banners.is_empty() {
+            output::display_banner(&banners);
+        }
+
         let result = self.run_interactive(prompt).await;
 
         self.agent
@@ -761,16 +780,6 @@ impl CliSession {
             RunMode::Normal => {
                 history.save(editor);
                 self.push_message(Message::user().with_text(content));
-
-                if let Err(e) = crate::project_tracker::update_project_tracker(
-                    Some(content),
-                    Some(&self.session_id),
-                ) {
-                    eprintln!(
-                        "Warning: Failed to update project tracker with instruction: {}",
-                        e
-                    );
-                }
 
                 let _provider = self.agent.provider().await?;
 
@@ -1070,6 +1079,15 @@ impl CliSession {
     }
 
     async fn handle_clear(&mut self) -> Result<()> {
+        let provider = self.agent.provider().await?;
+        if provider.manages_own_context() {
+            output::render_error(&context_management_unsupported_message(
+                "clear",
+                provider.get_name(),
+            ));
+            return Ok(());
+        }
+
         if let Err(e) = self
             .agent
             .config
@@ -1424,6 +1442,15 @@ impl CliSession {
     }
 
     async fn handle_compact(&mut self) -> Result<()> {
+        let provider = self.agent.provider().await?;
+        if provider.manages_own_context() {
+            output::render_error(&context_management_unsupported_message(
+                "compact",
+                provider.get_name(),
+            ));
+            return Ok(());
+        }
+
         let prompt = "Are you sure you want to compact this conversation? This will condense the message history.";
         let should_summarize = match cliclack::confirm(prompt).initial_value(true).interact() {
             Ok(choice) => choice,
@@ -1914,24 +1941,29 @@ impl CliSession {
                 &Message::assistant().with_text(interrupt_prompt),
                 self.debug,
             );
-        } else if let Some(last_msg) = self.messages.last() {
-            if last_msg.role == rmcp::model::Role::User {
-                match last_msg.content.first() {
-                    Some(MessageContent::ToolResponse(_)) => {
-                        self.push_message(Message::assistant().with_text(interrupt_prompt));
-                        output::render_message(
-                            &Message::assistant().with_text(interrupt_prompt),
-                            self.debug,
-                        );
-                    }
-                    Some(_) => {
-                        self.messages.pop();
-                        let assistant_msg = Message::assistant().with_text(interrupt_prompt);
-                        self.push_message(assistant_msg.clone());
-                        output::render_message(&assistant_msg, self.debug);
-                    }
-                    None => {
-                        // Empty message content — nothing to do, just continue gracefully
+        } else {
+            while self.messages.last().is_some_and(Message::is_turn_context) {
+                self.messages.pop();
+            }
+            if let Some(last_msg) = self.messages.last() {
+                if last_msg.role == rmcp::model::Role::User {
+                    match last_msg.content.first() {
+                        Some(MessageContent::ToolResponse(_)) => {
+                            self.push_message(Message::assistant().with_text(interrupt_prompt));
+                            output::render_message(
+                                &Message::assistant().with_text(interrupt_prompt),
+                                self.debug,
+                            );
+                        }
+                        Some(_) => {
+                            self.messages.pop();
+                            let assistant_msg = Message::assistant().with_text(interrupt_prompt);
+                            self.push_message(assistant_msg.clone());
+                            output::render_message(&assistant_msg, self.debug);
+                        }
+                        None => {
+                            // Empty message content — nothing to do, just continue gracefully
+                        }
                     }
                 }
             }
@@ -3067,6 +3099,32 @@ mod tests {
     }
 
     #[test]
+    fn planner_history_excludes_turn_context_events() {
+        use goose::conversation::message::MessageMetadata;
+
+        let history = Conversation::new_unvalidated([
+            Message::user().with_text("plan the refactor"),
+            Message::user()
+                .with_text("<turn-context>cwd /repo, todo: ship v2</turn-context>")
+                .with_metadata(MessageMetadata::agent_only().with_turn_context()),
+            Message::assistant().with_text("on it"),
+        ]);
+
+        let provider_text = planner_provider_messages(&history)
+            .agent_visible_messages()
+            .iter()
+            .map(|message| message.as_concat_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(provider_text.contains("plan the refactor"));
+        assert!(
+            !provider_text.contains("turn-context"),
+            "the planner prompt has no turn-context instructions, so blocks must not reach it"
+        );
+    }
+
+    #[test]
     fn test_format_elapsed_time_under_60_seconds() {
         // Test sub-second duration
         let duration = Duration::from_millis(500);
@@ -3285,6 +3343,9 @@ mod tests {
             description: goose::config::DEFAULT_EXTENSION_DESCRIPTION.to_string(),
             timeout: Some(300),
             socket: None,
+            client_id: None,
+            client_secret_key: None,
+            scopes: vec![],
             bundled: None,
             available_tools: vec![],
         }
@@ -3301,6 +3362,9 @@ mod tests {
             description: goose::config::DEFAULT_EXTENSION_DESCRIPTION.to_string(),
             timeout: Some(300),
             socket: None,
+            client_id: None,
+            client_secret_key: None,
+            scopes: vec![],
             bundled: None,
             available_tools: vec![],
         }
@@ -3317,6 +3381,9 @@ mod tests {
             description: goose::config::DEFAULT_EXTENSION_DESCRIPTION.to_string(),
             timeout: Some(300),
             socket: None,
+            client_id: None,
+            client_secret_key: None,
+            scopes: vec![],
             bundled: None,
             available_tools: vec![],
         }

@@ -533,6 +533,16 @@ mod tests {
             Some("zhipuai/glm-5".to_string())
         );
 
+        // === Kimi Code ===
+        assert_eq!(
+            map_to_canonical_model("kimi_code", "kimi-for-coding", r),
+            Some("kimi-for-coding/kimi-for-coding".to_string())
+        );
+        assert_eq!(
+            map_to_canonical_model("kimi_code", "kimi-for-coding-highspeed", r),
+            Some("kimi-for-coding/kimi-for-coding-highspeed".to_string())
+        );
+
         // === GCP Vertex AI ===
         assert_eq!(
             map_to_canonical_model("gcp_vertex_ai", "gemini-2.5-flash", r),
