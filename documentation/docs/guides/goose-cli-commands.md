@@ -215,7 +215,7 @@ Start or resume interactive chat sessions.
 - **`--max-turns <NUMBER>`**: Set the maximum number of turns allowed without user input (default: 1000)
 
 **Extension Options:**
-- **`--with-extension <command>`**: Add stdio extensions
+- **`--with-extension <command>`**: Add stdio extensions. Format: `[name:]ENV1=val1 command args...`. Without the optional `name:`, the extension is named after the command — which is the launcher, not the server, for anything started through one (`npx`, `python -m ...`, `uvx`). That name prefixes every tool the server exposes (`npx__search`), and extensions started by the same launcher would otherwise collide, so goose names colliding ones after their full command line instead. Give an explicit name to control it: `--with-extension "memory:npx -y @modelcontextprotocol/server-memory"` exposes `memory__search`.
 - **`--with-streamable-http-extension <url>`**: Add remote extensions over Streamable HTTP
 - **`--with-builtin <id>`**: Enable built-in extensions (e.g., 'developer', 'computercontroller')
 
@@ -244,6 +244,9 @@ goose session --resume --session-id 20251108_2 --fork --edit --history
 
 # Start with extensions
 goose session --with-extension "npx -y @modelcontextprotocol/server-memory"
+
+# Name an extension explicitly (tools become memory__*, not npx__*)
+goose session --with-extension "memory:npx -y @modelcontextprotocol/server-memory"
 goose session --with-builtin developer
 goose session --with-streamable-http-extension "http://localhost:8080/mcp"
 
@@ -692,7 +695,7 @@ goose acp
 ```
 
 :::info
-This command is automatically invoked by ACP-compatible clients and is not typically run directly by users. The client manages the lifecycle of the `goose acp` process. See [Using goose in ACP Clients](/docs/guides/acp-clients) for details.
+This command is automatically invoked by ACP-compatible clients and is not typically run directly by users. The client manages the lifecycle of the `goose acp` process. See [Using goose in ACP Clients](/docs/gdk/acp) for details.
 :::
 
 ---
@@ -787,14 +790,13 @@ Once you're in an interactive session (via `goose session` or `goose run --inter
 - **`/?` or `/help`** - Display the help menu
 - **`/builtin <names>`** - Add builtin extensions by name (comma-separated)
 - **`/clear`** - Clear the current chat history
-- **`/endplan`** - Exit plan mode and return to 'normal' goose mode
 - **`/exit` or `/quit`** - Exit the session
 - **`/extension <command>`** - Add a stdio extension (format: ENV1=val1 command args...)
 - **`/mode <name>`** - Set the goose mode to use ('auto', 'approve', 'chat', 'smart_approve')
-- **`/plan <message_text>`** - Enter 'plan' mode with optional message. Create a plan based on the current messages and ask user if they want to act on it
+- **`/model [name]`** - Show the current model, or switch models for this session while keeping the same provider
+- **`/model --provider <name> [model]`** - Switch to a different provider, optionally specifying a model
 - **`/prompt <n> [--info] [key=value...]`** - Get prompt info or execute a prompt
 - **`/prompts [--extension <name>]`** - List all available prompts, optionally filtered by extension
-- **`/recipe [filepath]`** - Generate a recipe from the current conversation and save it to the specified filepath (must end with .yaml). If no filepath is provided, it will be saved to ./recipe.yaml
 - **`/compact`** - Compact and summarize the current conversation to reduce context length while preserving key information
 - **`/r`** - Toggle full tool output display (show complete tool parameters without truncation)
 - **`/skills [<name>...]`** - List available skills, or load one or more skills by name
@@ -803,9 +805,6 @@ Once you're in an interactive session (via `goose session` or `goose run --inter
 
 **Examples:**
 ```bash
-# Create a plan for triaging test failures
-/plan let's create a plan for triaging test failures
-
 # List all prompts from the developer extension
 /prompts --extension developer
 

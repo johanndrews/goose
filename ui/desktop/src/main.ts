@@ -26,11 +26,13 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync, spawn, execFile } from 'child_process';
 import 'dotenv/config';
-import { checkBackendStatus } from './backendStatus';
+import { connectRemoteBackend } from './remoteBackends';
+import { installBackendCertificateVerifiers } from './backendCertificateVerifier';
+import { configureProxy } from './proxy';
 import { startGooseServe } from './gooseServe';
 import { getLoginShellPath } from './loginShellPath';
 import { GooseServeLeaseRegistry, type GooseServeLease } from './gooseServeLeaseRegistry';
-import { acpWebSocketUrlFromHttpBase, normalizeAcpHttpBaseUrl } from './acp/url';
+import { normalizeAcpHttpBaseUrl } from './acp/url';
 import { expandTilde, sanitizeGoosePathRoot } from './utils/pathUtils';
 import log from './utils/logger';
 import { ensureWinShims } from './utils/winShims';
@@ -51,11 +53,13 @@ import {
   updateTrayMenu,
 } from './utils/autoUpdater';
 import { UPDATES_ENABLED } from './updates';
+import './utils/gitBranchIpc';
 import './utils/recipeHash';
 import type { GooseApp } from './types/apps';
 import installExtension, { REACT_DEVELOPER_TOOLS } from 'electron-devtools-installer';
-import { BLOCKED_PROTOCOLS, WEB_PROTOCOLS } from './utils/urlSecurity';
-import { buildCSP } from './utils/csp';
+import { WEB_PROTOCOLS } from './utils/urlSecurity';
+import { openExternalUrl } from './utils/openExternalUrl';
+import { buildCSP, leaseBackendOrigin } from './utils/csp';
 import { resolveWorkingDir } from './utils/workingDir';
 import {
   DesktopFileAccess,
@@ -290,23 +294,6 @@ function listGitWorktreeDirs(dir: string): Promise<string[]> {
   });
 }
 
-async function configureProxy() {
-  const httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
-  const httpProxy = process.env.HTTP_PROXY || process.env.http_proxy;
-  const noProxy = process.env.NO_PROXY || process.env.no_proxy || '';
-
-  const proxyUrl = httpsProxy || httpProxy;
-
-  if (proxyUrl) {
-    console.log('[Main] Configuring proxy');
-    await session.defaultSession.setProxy({
-      proxyRules: proxyUrl,
-      proxyBypassRules: noProxy,
-    });
-    console.log('[Main] Proxy configured successfully');
-  }
-}
-
 if (started) app.quit();
 
 // Certificate trust for active backend leases. Renderer requests and
@@ -403,17 +390,15 @@ app.whenReady().then(() => {
   appConfig.GOOSE_LOCALE = getConfiguredGooseLocale();
 });
 
-// Main-process net.fetch: pin to the exact cert once known.
+// Main-process net.fetch and renderer WebSockets: pin to the exact cert once known.
 app.whenReady().then(() => {
-  session.defaultSession.setCertificateVerifyProc((request, callback) => {
-    if (!isTrustedHost(request.hostname)) {
-      callback(-3);
-      return;
+  installBackendCertificateVerifiers(
+    [session.defaultSession, session.fromPartition('persist:goose')],
+    {
+      has: isTrustedHost,
+      verify: verifyBackendCertificate,
     }
-
-    const match = verifyBackendCertificate(request.hostname, request.certificate.fingerprint);
-    callback(match ? 0 : -2);
-  });
+  );
 });
 
 if (process.env.ENABLE_PLAYWRIGHT) {
@@ -447,7 +432,7 @@ if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
 
 // Apply single instance lock on Windows and Linux where it's needed for deep links
 // macOS uses the 'open-url' event instead
-let gotTheLock = true;
+let gotTheLock: boolean;
 let openUrlHandledLaunch = false;
 if (process.platform !== 'darwin') {
   gotTheLock = app.requestSingleInstanceLock();
@@ -987,6 +972,11 @@ let appConfig = {
   GOOSE_PREDEFINED_MODELS: predefinedModels,
   GOOSE_PATH_ROOT: sanitizeGoosePathRoot(process.env),
   GOOSE_WORKING_DIR: '',
+  // Whether the window is bound to an external backend (fixed at window
+  // creation via gooseServeLeases) and which URL it is bound to.
+  GOOSE_EXTERNAL_BACKEND: false,
+  GOOSE_EXTERNAL_BACKEND_URL: '',
+  GOOSE_EXTERNAL_BACKEND_SOURCE: '',
   // Start with the env-var override; the OS region locale is filled in after app.ready
   // (see updateLocaleFromSystem below) since getSystemLocale() cannot be called earlier.
   GOOSE_LOCALE: process.env.GOOSE_LOCALE || undefined,
@@ -1126,20 +1116,20 @@ const createChat = async (
         );
       }
 
-      const externalBackendReady = await checkBackendStatus({
+      const externalBackendCheck = await connectRemoteBackend({
         baseUrl: externalBaseUrl,
         serverSecret,
-        fetch: net.fetch as unknown as typeof globalThis.fetch,
+        pinnedHostname: externalBackend.certFingerprint ? externalBase.hostname : null,
       });
-      if (!externalBackendReady) {
+      if (!externalBackendCheck.ok) {
         externalCertificateTrust?.release();
+        log.error(`External backend check failed: ${externalBackendCheck.failure}`);
         const canDisableExternalBackend = externalBackend.source === 'settings';
         const response = dialog.showMessageBoxSync({
           type: 'error',
           title: 'External Backend Unreachable',
           message: `Could not connect to external backend at ${externalBaseUrl}`,
-          detail:
-            'The external backend must be running and the configured secret must match GOOSE_SERVER__SECRET_KEY on the server.',
+          detail: externalBackendCheck.failure ?? undefined,
           buttons: canDisableExternalBackend
             ? ['Disable External Backend & Retry', 'Quit']
             : ['Quit'],
@@ -1160,13 +1150,18 @@ const createChat = async (
         return;
       }
 
+      const resolvedAcpUrl = externalBackendCheck.acpUrl;
+      if (!resolvedAcpUrl) {
+        throw new Error('External backend check did not resolve an ACP endpoint');
+      }
+
+      const originLease = leaseBackendOrigin(resolvedAcpUrl);
       const leaseCertificateTrust = externalCertificateTrust;
       externalCertificateTrust = null;
-      gooseServeLease = gooseServeLeases.createExternal(
-        acpWebSocketUrlFromHttpBase(externalBaseUrl, serverSecret),
-        serverSecret,
-        leaseCertificateTrust ? async () => leaseCertificateTrust.release() : undefined
-      );
+      gooseServeLease = gooseServeLeases.createExternal(resolvedAcpUrl, serverSecret, async () => {
+        originLease.release();
+        leaseCertificateTrust?.release();
+      });
     } catch (error) {
       externalCertificateTrust?.release();
       log.error('External ACP backend is misconfigured', error);
@@ -1309,6 +1304,9 @@ const createChat = async (
             ...appConfig,
             GOOSE_LOCALE: getConfiguredGooseLocale(),
             GOOSE_WORKING_DIR: workingDir,
+            GOOSE_EXTERNAL_BACKEND: externalBackend !== null,
+            GOOSE_EXTERNAL_BACKEND_URL: externalBackend?.url ?? '',
+            GOOSE_EXTERNAL_BACKEND_SOURCE: externalBackend?.source ?? '',
             REQUEST_DIR: dir,
             GOOSE_VERSION: version,
             recipeDeeplink: recipeDeeplink,
@@ -1414,16 +1412,9 @@ const createChat = async (
 
   // Handle new window creation for links (fallback for any links not handled by onClick)
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    try {
-      const protocol = new URL(url).protocol;
-      if (BLOCKED_PROTOCOLS.includes(protocol)) {
-        return { action: 'deny' };
-      }
-    } catch {
-      return { action: 'deny' };
-    }
-
-    shell.openExternal(url);
+    void openExternalUrl(url, mainWindow, getConfiguredGooseLocale()).catch((error) => {
+      log.error('Failed to open external URL:', error);
+    });
     return { action: 'deny' };
   });
 
@@ -1432,15 +1423,9 @@ const createChat = async (
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   mainWindow.webContents.on('new-window' as any, function (event: any, url: string) {
     event.preventDefault();
-    try {
-      const protocol = new URL(url).protocol;
-      if (BLOCKED_PROTOCOLS.includes(protocol)) {
-        return;
-      }
-    } catch {
-      return;
-    }
-    shell.openExternal(url);
+    void openExternalUrl(url, mainWindow, getConfiguredGooseLocale()).catch((error) => {
+      log.error('Failed to open external URL:', error);
+    });
   });
 
   const windowId = mainWindow.id;
@@ -1942,15 +1927,9 @@ ipcMain.on('react-ready', (event) => {
   }
 });
 
-ipcMain.handle('open-external', async (_event, url: string) => {
-  const parsedUrl = new URL(url);
-
-  if (BLOCKED_PROTOCOLS.includes(parsedUrl.protocol)) {
-    console.warn(`[Main] Blocked dangerous protocol: ${parsedUrl.protocol}`);
-    return;
-  }
-
-  await shell.openExternal(url);
+ipcMain.handle('open-external', async (event, url: string) => {
+  const senderWindow = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+  return openExternalUrl(url, senderWindow, getConfiguredGooseLocale());
 });
 
 ipcMain.handle('directory-chooser', async () => {
@@ -1997,6 +1976,7 @@ const validSettingKeys: Set<string> = new Set([
   'seenAnnouncementIds',
   'disableAutoDownload',
   'recentModels',
+  'useLegacyAgentLoop',
 ]);
 
 ipcMain.handle('set-setting', (_event, key: SettingKey, value: unknown) => {
@@ -2482,7 +2462,8 @@ async function appMain() {
     }
   });
 
-  await configureProxy();
+  const rendererSession = session.fromPartition('persist:goose');
+  await configureProxy(session.defaultSession, rendererSession);
 
   // Ensure Windows shims are available before any MCP processes are spawned
   await ensureWinShims();
@@ -2503,7 +2484,7 @@ async function appMain() {
 
   // Add CSP headers to all sessions, recomputed on every response so external
   // backend settings take effect without restarting the app.
-  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+  rendererSession.webRequest.onHeadersReceived((details, callback) => {
     const currentSettings = getSettings();
     callback({
       responseHeaders: {
@@ -2701,7 +2682,7 @@ async function appMain() {
       );
     }
 
-    fileMenu.submenu.insert(menuIndex++, new MenuItem({ type: 'separator' }));
+    fileMenu.submenu.insert(menuIndex, new MenuItem({ type: 'separator' }));
 
     if (shortcuts.focusWindow) {
       fileMenu.submenu.append(

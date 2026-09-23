@@ -245,7 +245,6 @@ impl GooseCompleter {
             "/extensions".to_string(),
             "/mode".to_string(),
             "/model".to_string(),
-            "/recipe".to_string(),
             "/new".to_string(),
             "/resume".to_string(),
         ];
@@ -850,7 +849,6 @@ mod tests {
             "/builtin",
             "/mode",
             "/model",
-            "/recipe",
         ];
         for cli_only in cli_only_commands {
             assert!(

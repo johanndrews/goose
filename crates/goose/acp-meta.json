@@ -66,6 +66,21 @@
       "responseType": "SteerSessionResponse_unstable"
     },
     {
+      "method": "_goose/unstable/session/live-voice/availability",
+      "requestType": "LiveVoiceAvailabilityRequest_unstable",
+      "responseType": "LiveVoiceAvailabilityResponse_unstable"
+    },
+    {
+      "method": "_goose/unstable/session/live-voice/start",
+      "requestType": "LiveVoiceStartRequest_unstable",
+      "responseType": "LiveVoiceStartResponse_unstable"
+    },
+    {
+      "method": "_goose/unstable/session/live-voice/stop",
+      "requestType": "LiveVoiceStopRequest_unstable",
+      "responseType": "EmptyResponse"
+    },
+    {
       "method": "_goose/unstable/diagnostics/get",
       "requestType": "DiagnosticsGetRequest_unstable",
       "responseType": "DiagnosticsGetResponse_unstable"
@@ -91,19 +106,9 @@
       "responseType": "PromptOperationResponse_unstable"
     },
     {
-      "method": "session/delete",
-      "requestType": "DeleteSessionRequest",
-      "responseType": "EmptyResponse"
-    },
-    {
       "method": "_goose/unstable/config/extensions/list",
       "requestType": "GetConfigExtensionsRequest_unstable",
       "responseType": "GetConfigExtensionsResponse_unstable"
-    },
-    {
-      "method": "_goose/unstable/extensions/available",
-      "requestType": "GetAvailableExtensionsRequest_unstable",
-      "responseType": "GetAvailableExtensionsResponse_unstable"
     },
     {
       "method": "_goose/unstable/config/extensions/add",
@@ -228,11 +233,6 @@
     {
       "method": "_goose/unstable/preferences/save",
       "requestType": "PreferencesSaveRequest_unstable",
-      "responseType": "EmptyResponse"
-    },
-    {
-      "method": "_goose/unstable/preferences/remove",
-      "requestType": "PreferencesRemoveRequest_unstable",
       "responseType": "EmptyResponse"
     },
     {
@@ -476,16 +476,6 @@
       "responseType": "DictationConfigResponse_unstable"
     },
     {
-      "method": "_goose/unstable/dictation/secret/save",
-      "requestType": "DictationSecretSaveRequest_unstable",
-      "responseType": "EmptyResponse"
-    },
-    {
-      "method": "_goose/unstable/dictation/secret/delete",
-      "requestType": "DictationSecretDeleteRequest_unstable",
-      "responseType": "EmptyResponse"
-    },
-    {
       "method": "_goose/unstable/dictation/models/list",
       "requestType": "DictationModelsListRequest_unstable",
       "responseType": "DictationModelsListResponse_unstable"
@@ -508,11 +498,6 @@
     {
       "method": "_goose/unstable/dictation/models/delete",
       "requestType": "DictationModelDeleteRequest_unstable",
-      "responseType": "EmptyResponse"
-    },
-    {
-      "method": "_goose/unstable/dictation/models/select",
-      "requestType": "DictationModelSelectRequest_unstable",
       "responseType": "EmptyResponse"
     },
     {
@@ -575,6 +560,10 @@
     {
       "method": "_goose/unstable/session/update",
       "paramsType": "GooseSessionNotification_unstable"
+    },
+    {
+      "method": "_goose/unstable/providers/authentication/device-code",
+      "paramsType": "ProviderDeviceCodeNotification_unstable"
     }
   ],
   "agentRequests": [

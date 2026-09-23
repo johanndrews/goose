@@ -16,7 +16,7 @@ static STRIP_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
 });
 
 static CLAUDE_PATTERNS: Lazy<Vec<(Regex, Regex, &'static str)>> = Lazy::new(|| {
-    ["sonnet", "opus", "haiku"]
+    ["sonnet", "opus", "haiku", "fable"]
         .iter()
         .map(|&size| {
             (
@@ -34,7 +34,7 @@ pub fn canonical_name(provider: &str, model: &str) -> String {
     format!("{}/{}", provider, model_base)
 }
 
-fn is_meta_provider(provider: &str) -> bool {
+pub(crate) fn is_meta_provider(provider: &str) -> bool {
     matches!(
         provider,
         "databricks" | "databricks_v2" | "tetrate" | "bedrock" | "azure" | "azure_foundry"
@@ -44,17 +44,19 @@ fn is_meta_provider(provider: &str) -> bool {
 pub fn map_provider_name(provider: &str) -> &str {
     match provider {
         // Goose provider names that differ from models.dev names
-        "xai" => "x-ai",
+        "xai" | "xai_oauth" => "x-ai",
         "azure_openai" | "azure_foundry" => "azure",
         "aws_bedrock" => "amazon-bedrock",
         "gcp_vertex_ai" => "google-vertex",
         "gemini_oauth" => "google",
         "databricks_v2" => "databricks",
         "zhipu" => "zhipuai",
+        "together" => "togetherai",
         "novita" => "novita-ai",
         "opencode_go" => "opencode-go",
+        "opencode_zen" => "opencode",
         "ollama_cloud" => "ollama-cloud",
-        "kimi_code" => "kimi-for-coding",
+        "kimi_code" => "kimi-code-plan-cn",
         _ => provider,
     }
 }
@@ -338,12 +340,20 @@ mod tests {
             Some("openai/gpt-4o".to_string())
         );
         assert_eq!(
+            map_to_canonical_model("xai_oauth", "grok-4.5", r),
+            Some("x-ai/grok-4.5".to_string())
+        );
+        assert_eq!(
             map_to_canonical_model("openai", "gpt-4-turbo-2024-04-09", r),
             Some("openai/gpt-4-turbo".to_string())
         );
         assert_eq!(
             map_to_canonical_model("opencode_go", "kimi-k2.6", r),
             Some("opencode-go/kimi-k2.6".to_string())
+        );
+        assert_eq!(
+            map_to_canonical_model("opencode_zen", "kimi-k3", r),
+            Some("opencode/kimi-k3".to_string())
         );
 
         // === OpenRouter ===
@@ -464,12 +474,12 @@ mod tests {
 
         // === DeepSeek ===
         assert_eq!(
-            map_to_canonical_model("databricks", "databricks-deepseek-chat", r),
-            Some("deepseek/deepseek-chat".to_string())
+            map_to_canonical_model("databricks", "databricks-deepseek-v4-flash", r),
+            Some("deepseek/deepseek-v4-flash".to_string())
         );
         assert_eq!(
-            map_to_canonical_model("databricks", "deepseek-reasoner", r),
-            Some("deepseek/deepseek-reasoner".to_string())
+            map_to_canonical_model("databricks", "deepseek-v4-pro", r),
+            Some("deepseek/deepseek-v4-pro".to_string())
         );
 
         // === Grok (X.AI) ===
@@ -515,8 +525,8 @@ mod tests {
             Some("mistralai/codestral".to_string())
         );
         assert_eq!(
-            map_to_canonical_model("databricks", "deepseek-deepseek-chat", r),
-            Some("deepseek/deepseek-chat".to_string())
+            map_to_canonical_model("databricks", "deepseek-deepseek-v4-flash", r),
+            Some("deepseek/deepseek-v4-flash".to_string())
         );
         assert_eq!(
             map_to_canonical_model("databricks", "x-ai-grok-4.3", r),
@@ -536,11 +546,15 @@ mod tests {
         // === Kimi Code ===
         assert_eq!(
             map_to_canonical_model("kimi_code", "kimi-for-coding", r),
-            Some("kimi-for-coding/kimi-for-coding".to_string())
+            Some("kimi-code-plan-cn/kimi-for-coding".to_string())
         );
         assert_eq!(
             map_to_canonical_model("kimi_code", "kimi-for-coding-highspeed", r),
-            Some("kimi-for-coding/kimi-for-coding-highspeed".to_string())
+            Some("kimi-code-plan-cn/kimi-for-coding-highspeed".to_string())
+        );
+        assert_eq!(
+            map_to_canonical_model("kimi_code", "k3", r),
+            Some("kimi-code-plan-cn/k3".to_string())
         );
 
         // === GCP Vertex AI ===

@@ -3,16 +3,18 @@
 #[path = "acp_common_tests/mod.rs"]
 mod common_tests;
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ListSessionsRequest, ListSessionsResponse, NewSessionRequest, PromptRequest,
-    SessionConfigKind, SessionConfigOptionCategory, SessionConfigOptionValue, SessionInfo,
-    SetSessionConfigOptionRequest, StopReason, TextContent,
+    ContentBlock, ListSessionsRequest, ListSessionsResponse, McpServer, McpServerHttp,
+    NewSessionRequest, PromptRequest, SessionConfigKind, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionInfo, SessionUpdate, SetSessionConfigOptionRequest,
+    StopReason, TextContent,
 };
 use agent_client_protocol::ErrorCode;
 use common_tests::fixtures::server::{
     assert_session_response_precedes_available_commands, AcpServerConnection,
 };
 use common_tests::fixtures::{
-    run_test, spawn_acp_server_in_process, Connection, OpenAiFixture, Session, TestConnectionConfig,
+    run_test, spawn_acp_server_in_process, Connection, OpenAiFixture, PermissionDecision, Session,
+    SessionData, TestConnectionConfig,
 };
 #[cfg(feature = "code-mode")]
 use common_tests::run_prompt_codemode;
@@ -31,10 +33,13 @@ use common_tests::{
 };
 use goose::config::GooseMode;
 use goose::conversation::message::{Message, MessageMetadata};
-use goose::custom_requests::{GetSessionInfoRequest, GetSessionInfoResponse};
+use goose::custom_requests::{
+    GetSessionInfoRequest, GetSessionInfoResponse, UpdateSessionProjectRequest,
+};
 use goose::recipe::{Recipe, Settings};
 use goose::recipe_deeplink;
 use goose::session::{SessionManager, SessionType};
+use goose_test_support::{McpFixture, FAKE_CODE};
 use std::path::Path;
 
 tests_config_option_set_error!(AcpServerConnection);
@@ -511,6 +516,176 @@ fn test_get_session_info() {
         assert_eq!(meta.get("userSetName"), Some(&serde_json::json!(false)));
         assert_eq!(meta.get("sessionType"), Some(&serde_json::json!("acp")));
         assert_eq!(meta.get("hasRecipe"), Some(&serde_json::json!(false)));
+    });
+}
+
+#[test]
+fn test_update_session_project_rejects_hidden_session_types() {
+    run_test(async {
+        let data_root = tempfile::tempdir().unwrap();
+        let working_dir = tempfile::tempdir().unwrap();
+        let session_manager = SessionManager::new(data_root.path().to_path_buf());
+        let mut hidden_sessions = Vec::new();
+
+        for session_type in [
+            SessionType::Gateway,
+            SessionType::SubAgent,
+            SessionType::Hidden,
+            SessionType::Terminal,
+        ] {
+            hidden_sessions.push(
+                session_manager
+                    .create_session(
+                        working_dir.path().to_path_buf(),
+                        format!("{session_type} session"),
+                        session_type,
+                        GooseMode::default(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let conn = new_connection(data_root.path()).await;
+        for session in hidden_sessions {
+            let error = conn
+                .cx()
+                .send_request(UpdateSessionProjectRequest {
+                    session_id: session.id.clone(),
+                    project_id: Some("untrusted-project".to_string()),
+                })
+                .block_task()
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceNotFound);
+
+            let stored = session_manager
+                .get_session(&session.id, false)
+                .await
+                .unwrap();
+            assert_eq!(stored.project_id, None);
+        }
+    });
+}
+
+#[test]
+fn test_update_session_project_rejects_unknown_persisted_session_type() {
+    run_test(async {
+        let data_root = tempfile::tempdir().unwrap();
+        let working_dir = tempfile::tempdir().unwrap();
+        let session_manager = SessionManager::new(data_root.path().to_path_buf());
+        let session = session_manager
+            .create_session(
+                working_dir.path().to_path_buf(),
+                "Future session".to_string(),
+                SessionType::User,
+                GooseMode::default(),
+            )
+            .await
+            .unwrap();
+        let db_path = data_root
+            .path()
+            .join(goose::session::session_manager::SESSIONS_FOLDER)
+            .join(goose::session::session_manager::DB_NAME);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(db_path))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sessions SET session_type = 'future_type' WHERE id = ?")
+            .bind(&session.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session_manager
+                .get_session(&session.id, false)
+                .await
+                .unwrap()
+                .session_type,
+            SessionType::User
+        );
+
+        let conn = new_connection(data_root.path()).await;
+        let error = conn
+            .cx()
+            .send_request(UpdateSessionProjectRequest {
+                session_id: session.id.clone(),
+                project_id: Some("untrusted-project".to_string()),
+            })
+            .block_task()
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceNotFound);
+
+        let project_id =
+            sqlx::query_scalar::<_, Option<String>>("SELECT project_id FROM sessions WHERE id = ?")
+                .bind(&session.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(project_id, None);
+    });
+}
+
+#[test]
+fn test_update_session_project_allows_visible_session_types() {
+    run_test(async {
+        let data_root = tempfile::tempdir().unwrap();
+        let working_dir = tempfile::tempdir().unwrap();
+        let session_manager = SessionManager::new(data_root.path().to_path_buf());
+        let mut visible_sessions = Vec::new();
+
+        for session_type in [SessionType::User, SessionType::Scheduled, SessionType::Acp] {
+            visible_sessions.push(
+                session_manager
+                    .create_session(
+                        working_dir.path().to_path_buf(),
+                        format!("{session_type} session"),
+                        session_type,
+                        GooseMode::default(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let conn = new_connection(data_root.path()).await;
+        for session in visible_sessions {
+            conn.cx()
+                .send_request(UpdateSessionProjectRequest {
+                    session_id: session.id.clone(),
+                    project_id: Some("project".to_string()),
+                })
+                .block_task()
+                .await
+                .unwrap();
+            assert_eq!(
+                session_manager
+                    .get_session(&session.id, false)
+                    .await
+                    .unwrap()
+                    .project_id,
+                Some("project".to_string())
+            );
+
+            conn.cx()
+                .send_request(UpdateSessionProjectRequest {
+                    session_id: session.id.clone(),
+                    project_id: None,
+                })
+                .block_task()
+                .await
+                .unwrap();
+            assert_eq!(
+                session_manager
+                    .get_session(&session.id, false)
+                    .await
+                    .unwrap()
+                    .project_id,
+                None
+            );
+        }
     });
 }
 
@@ -1035,6 +1210,92 @@ fn test_prompt_image_attachment() {
 #[test]
 fn test_prompt_mcp() {
     run_test(async { run_prompt_mcp::<AcpServerConnection>().await });
+}
+
+/// Selects the agent loop until dropped. Only use inside `run_test`: it holds the
+/// ACP test lock, so no other test in this binary observes the override.
+struct AgentLoopOverride(Option<std::ffi::OsString>);
+
+impl AgentLoopOverride {
+    fn new(state_machine: bool) -> Self {
+        let previous = std::env::var_os("GOOSE_STATE_MACHINE");
+        std::env::set_var("GOOSE_STATE_MACHINE", if state_machine { "1" } else { "0" });
+        Self(previous)
+    }
+}
+
+impl Drop for AgentLoopOverride {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(previous) => std::env::set_var("GOOSE_STATE_MACHINE", previous),
+            None => std::env::remove_var("GOOSE_STATE_MACHINE"),
+        }
+    }
+}
+
+/// Two provider calls separated by a tool call. The canned responses report 2469
+/// and then 2631 total tokens, so 2469 can only arrive in an update sent while
+/// the prompt is still running.
+async fn assert_usage_updates_during_prompt(state_machine: bool) {
+    let _agent_loop = AgentLoopOverride::new(state_machine);
+    let prompt = "Use the get_code tool and output only its result.";
+    let mcp = McpFixture::new().await;
+    let openai = OpenAiFixture::new(
+        vec![
+            (
+                prompt.to_string(),
+                include_str!("acp_test_data/openai_tool_call.txt"),
+            ),
+            (
+                FAKE_CODE.to_string(),
+                include_str!("acp_test_data/openai_tool_result.txt"),
+            ),
+        ],
+        <AcpServerConnection as Connection>::expected_session_id(),
+    )
+    .await;
+    let config = TestConnectionConfig {
+        mcp_servers: vec![McpServer::Http(McpServerHttp::new("mcp-fixture", &mcp.url))],
+        ..Default::default()
+    };
+    let mut conn = <AcpServerConnection as Connection>::new(config, openai).await;
+    let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+
+    let output = session
+        .prompt(prompt, PermissionDecision::Cancel)
+        .await
+        .unwrap();
+
+    let mut used = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while used.len() < 3 && tokio::time::Instant::now() < deadline {
+        used.extend(
+            session
+                .session_updates()
+                .into_iter()
+                .filter_map(|update| match update {
+                    SessionUpdate::UsageUpdate(usage) => Some(usage.used),
+                    _ => None,
+                }),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        used,
+        [2469, 2631, 2631],
+        "state_machine={state_machine}, agent text: {}",
+        output.text
+    );
+}
+
+#[test]
+fn test_prompt_usage_updates_during_turn_legacy_loop() {
+    run_test(async { assert_usage_updates_during_prompt(false).await });
+}
+
+#[test]
+fn test_prompt_usage_updates_during_turn_state_machine() {
+    run_test(async { assert_usage_updates_during_prompt(true).await });
 }
 
 #[test]

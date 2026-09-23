@@ -48,13 +48,14 @@ export interface Settings {
   keyboardShortcuts: KeyboardShortcuts;
 
   // UI preferences (migrated from localStorage)
-  theme: 'dark' | 'light';
+  theme: 'dark' | 'light' | 'aura';
   useSystemTheme: boolean;
   language: LanguageSetting;
   responseStyle: string;
   showPricing: boolean;
   seenAnnouncementIds: string[];
   recentModels: RecentModel[];
+  useLegacyAgentLoop: boolean;
 }
 
 export type SettingKey = keyof Settings;
@@ -96,6 +97,7 @@ export const defaultSettings: Settings = {
   showPricing: true,
   seenAnnouncementIds: [],
   recentModels: [],
+  useLegacyAgentLoop: false,
 };
 
 export function getKeyboardShortcuts(settings: Settings): KeyboardShortcuts {

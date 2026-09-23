@@ -30,6 +30,49 @@ describe('ACP providers', () => {
     vi.clearAllMocks();
   });
 
+  it('exposes Coding Plan in Desktop setup and refreshes newly discovered models', async () => {
+    const entry = providerEntry({
+      providerId: 'zai_coding_plan',
+      providerName: 'Z.AI Coding Plan',
+      providerType: 'Declarative',
+      acp: false,
+      configKeys: [{ name: 'ZAI_CODING_PLAN_API_KEY', required: true, secret: true }],
+    });
+    const discovered = {
+      ...entry,
+      models: [{ id: 'glm-future', name: 'glm-future', recommended: true }],
+    };
+    const client = {
+      goose: {
+        providersList_unstable: vi
+          .fn()
+          .mockResolvedValueOnce({ entries: [entry] })
+          .mockResolvedValueOnce({ entries: [entry] })
+          .mockResolvedValueOnce({ entries: [discovered] }),
+        providersReadinessCheck_unstable: vi.fn().mockResolvedValue({ ready: true }),
+        providersInventoryRefresh_unstable: vi
+          .fn()
+          .mockResolvedValue({ started: ['zai_coding_plan'], skipped: [] }),
+      },
+    };
+    vi.mocked(getAcpClient).mockResolvedValue(
+      client as unknown as Awaited<ReturnType<typeof getAcpClient>>
+    );
+
+    const setup = await acpListSetupProviderDetails();
+    expect(setup[0].metadata.display_name).toBe('Z.AI Coding Plan');
+    expect(setup[0].supports_refresh).toBe(true);
+    expect(setup[0].metadata.config_keys[0].name).toBe('ZAI_CODING_PLAN_API_KEY');
+
+    const refreshed = await acpRefreshProviderDetails('zai_coding_plan');
+    expect(client.goose.providersInventoryRefresh_unstable).toHaveBeenCalledWith({
+      providerIds: ['zai_coding_plan'],
+    });
+    expect(refreshed.provider.metadata.known_models.map((model) => model.name)).toEqual([
+      'glm-future',
+    ]);
+  });
+
   it('sets thinking effort after provider and model, then returns the final config response', async () => {
     const client = {
       connection: {
@@ -165,15 +208,14 @@ describe('ACP providers', () => {
     expect((await acpGetProviderDetails('claude-code')).replacement).toBe('claude-acp');
   });
 
-  it('uses the explicit ACP capability instead of category or provider id', async () => {
+  it('uses the explicit ACP capability instead of provider id', async () => {
     const custom = providerEntry({
       providerId: 'custom_example-acp',
       providerType: 'Custom',
-      category: 'model',
       acp: false,
     });
-    const agent = providerEntry({ providerId: 'cursor-agent', category: 'agent', acp: false });
-    const acp = providerEntry({ providerId: 'pi-acp', category: 'agent', acp: true });
+    const agent = providerEntry({ providerId: 'cursor-agent', acp: false });
+    const acp = providerEntry({ providerId: 'pi-acp', acp: true });
     const client = {
       goose: {
         providersList_unstable: vi.fn().mockResolvedValue({ entries: [custom, agent, acp] }),
@@ -219,7 +261,7 @@ describe('ACP providers', () => {
 
     expect(result.connectionChecked).toBe(true);
     expect(result.provider.metadata.known_models).toEqual([
-      { name: 'claude-sonnet', context_limit: 0, reasoning: undefined },
+      { name: 'claude-sonnet', context_limit: undefined, reasoning: undefined },
     ]);
   });
 
@@ -268,7 +310,7 @@ describe('ACP providers', () => {
     });
     expect(enabled.is_configured).toBe(true);
     expect(enabled.metadata.known_models).toEqual([
-      { name: 'claude-sonnet', context_limit: 0, reasoning: undefined },
+      { name: 'claude-sonnet', context_limit: undefined, reasoning: undefined },
     ]);
   });
 
@@ -338,7 +380,6 @@ function providerEntry(overrides: Record<string, unknown> = {}) {
     configured: true,
     available: true,
     providerType: 'Builtin',
-    category: 'agent',
     acp: true,
     visibleInSetup: true,
     deprecated: false,

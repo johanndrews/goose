@@ -3,13 +3,17 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell as ClapShell};
 use clap_complete_nushell::Nushell as ClapNushell;
 use goose::agents::GoosePlatform;
+#[cfg(feature = "bundled-mcp")]
 use goose::builtin_extension::register_builtin_extensions;
 use goose::config::{Config, GooseMode};
 #[cfg(feature = "telemetry")]
 use goose::posthog::get_telemetry_choice;
 use goose::recipe::Recipe;
+#[cfg(feature = "acp-http")]
 use goose::source_roots::SourceRoot;
+#[cfg(feature = "bundled-mcp")]
 use goose_mcp::mcp_server_runner::{serve, McpCommand};
+#[cfg(feature = "bundled-mcp")]
 use goose_mcp::{AutoVisualiserRouter, ComputerControllerServer, MemoryServer, TutorialServer};
 
 #[cfg(feature = "telemetry")]
@@ -18,10 +22,13 @@ use crate::commands::configure::handle_configure;
 use crate::commands::info::handle_info;
 use crate::commands::plugin::{handle_plugin_install, handle_plugin_update};
 use crate::commands::recipe::{handle_deeplink, handle_list, handle_open, handle_validate};
+#[cfg(feature = "roaming")]
+use crate::commands::roam::{handle_roam_command, RoamCommand};
 use crate::commands::term::{
     handle_term_info, handle_term_init, handle_term_log, handle_term_run, Shell,
 };
 
+#[cfg(feature = "scheduler")]
 use crate::commands::schedule::{
     handle_schedule_add, handle_schedule_cron_help, handle_schedule_list, handle_schedule_remove,
     handle_schedule_run_now, handle_schedule_services_status, handle_schedule_services_stop,
@@ -37,8 +44,10 @@ use goose::session::session_manager::SessionType;
 use goose::session::SessionManager;
 use std::io::Read;
 use std::path::PathBuf;
+#[cfg(feature = "acp-http")]
 const GOOSE_SERVER_SECRET_KEY_ENV: &str = "GOOSE_SERVER__SECRET_KEY";
 
+#[cfg(feature = "acp-http")]
 fn generate_serve_secret_key() -> String {
     use rand::distr::{Alphanumeric, SampleString};
 
@@ -176,7 +185,7 @@ pub struct ExtensionOptions {
         long = "with-extension",
         value_name = "COMMAND",
         help = "Add stdio extensions (can be specified multiple times)",
-        long_help = "Add stdio extensions from full commands with environment variables. Can be specified multiple times. Format: 'ENV1=val1 ENV2=val2 command args...'",
+        long_help = "Add stdio extensions from full commands with environment variables. Can be specified multiple times. Format: '[name:]ENV1=val1 ENV2=val2 command args...'. Without the optional name, the extension is named after the command, which is the launcher for anything started through one ('npx', 'python', 'uvx', ...); extensions that would end up sharing a name are instead named after their full command line.",
         action = clap::ArgAction::Append
     )]
     pub extensions: Vec<String>,
@@ -603,6 +612,7 @@ enum SessionCommand {
     },
 }
 
+#[cfg(feature = "scheduler")]
 #[derive(Subcommand, Debug)]
 enum SchedulerCommand {
     #[command(about = "Add a new scheduled job")]
@@ -817,6 +827,7 @@ enum Command {
     Doctor {},
 
     /// Manage system prompts and behaviors
+    #[cfg(feature = "bundled-mcp")]
     #[command(about = "Run one of the mcp servers bundled with goose")]
     Mcp {
         #[arg(value_parser = clap::value_parser!(McpCommand))]
@@ -840,7 +851,16 @@ enum Command {
         enable_scheduler: bool,
     },
 
+    /// Share or connect to agents peer-to-peer over iroh
+    #[cfg(feature = "roaming")]
+    #[command(about = "Share or connect to agents peer-to-peer (roaming)")]
+    Roam {
+        #[command(subcommand)]
+        command: RoamCommand,
+    },
+
     /// Start ACP server over HTTP and WebSocket
+    #[cfg(feature = "acp-http")]
     #[command(about = "Start ACP server over HTTP and WebSocket")]
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
@@ -887,6 +907,14 @@ enum Command {
 
         #[arg(long, help = "Enable scheduled recipe execution")]
         enable_scheduler: bool,
+
+        /// Also expose this server over goose roam (p2p) so paired devices can connect remotely
+        #[cfg(feature = "roaming")]
+        #[arg(
+            long,
+            help = "Also expose this server over goose roam (p2p) so paired devices can connect remotely"
+        )]
+        roam: bool,
     },
 
     /// Start or resume interactive chat sessions
@@ -935,6 +963,15 @@ enum Command {
             requires = "resume"
         )]
         history: bool,
+
+        /// Additional system prompt to customize agent behavior
+        #[arg(
+            long = "system",
+            value_name = "TEXT",
+            help = "Additional system prompt to customize agent behavior",
+            long_help = "Provide additional system instructions to customize the agent's behavior"
+        )]
+        system: Option<String>,
 
         #[command(flatten)]
         session_opts: SessionOptions,
@@ -993,6 +1030,7 @@ enum Command {
     },
 
     /// Manage scheduled jobs
+    #[cfg(feature = "scheduler")]
     #[command(about = "Manage scheduled jobs", visible_alias = "sched")]
     Schedule {
         #[command(subcommand)]
@@ -1043,27 +1081,6 @@ enum Command {
     Term {
         #[command(subcommand)]
         command: TermCommand,
-    },
-
-    /// Launch the goose terminal UI (TUI)
-    #[cfg(feature = "tui")]
-    #[command(
-        about = "Launch the goose terminal UI",
-        long_about = "Launch the goose terminal UI (the @aaif/goose npm package).\n\
-                      \n\
-                      Resolution order:\n  \
-                      1. GOOSE_TUI_SCRIPT, if set to an existing dist/tui.js\n  \
-                      2. A local checkout's ui/text/dist/tui.js (dev workflow)\n  \
-                      3. `npx --yes --package <spec> -- goose-tui` (deployed installs)\n\
-                      \n\
-                      Override the npm spec via GOOSE_TUI_NPM_SPEC (default: @aaif/goose@latest).\n\
-                      Local script mode requires `node` on PATH; npx mode requires `npx` on PATH.\n\
-                      Any extra arguments are passed through to the TUI."
-    )]
-    Tui {
-        /// Arguments forwarded to the TUI
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
     },
 
     /// Manage local inference models
@@ -1194,6 +1211,23 @@ enum Command {
         #[arg(help = "Path to the bundled-extensions.json file")]
         file: PathBuf,
     },
+
+    #[command(
+        name = "mcp-probe",
+        about = "Start a Goose MCP session without an LLM and inspect a stdio MCP server",
+        hide = true
+    )]
+    McpProbe {
+        #[arg(help = "Stdio MCP server command to inspect")]
+        extension: String,
+
+        #[arg(
+            long,
+            value_name = "PATH|-",
+            help = "JSON probe script; use - for stdin"
+        )]
+        script: Option<String>,
+    },
 }
 
 #[cfg(feature = "local-inference")]
@@ -1203,11 +1237,31 @@ enum LocalModelsCommand {
     #[command(about = "Search HuggingFace for local GGUF and MLX models")]
     Search {
         /// Search query
-        query: String,
+        query: Option<String>,
 
         /// Maximum number of results
         #[arg(short, long, default_value = "10")]
         limit: usize,
+
+        /// Only include repos whose id starts with this prefix
+        #[arg(long)]
+        repo_prefix: Option<String>,
+
+        /// Only include repos whose id ends with this suffix
+        #[arg(long)]
+        repo_suffix: Option<String>,
+
+        /// Only include variants whose quantization contains this text
+        #[arg(long)]
+        quant: Option<String>,
+
+        /// Override available memory used for recommendations, in GB
+        #[arg(long)]
+        ram_gb: Option<f64>,
+
+        /// Print results as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Download a model from HuggingFace
@@ -1338,12 +1392,17 @@ fn get_command_name(command: &Option<Command>) -> &'static str {
         Some(Command::Configure {}) => "configure",
         Some(Command::Doctor {}) => "doctor",
         Some(Command::Info { .. }) => "info",
+        #[cfg(feature = "bundled-mcp")]
         Some(Command::Mcp { .. }) => "mcp",
         Some(Command::Acp { .. }) => "acp",
+        #[cfg(feature = "roaming")]
+        Some(Command::Roam { .. }) => "roam",
+        #[cfg(feature = "acp-http")]
         Some(Command::Serve { .. }) => "serve",
         Some(Command::Session { .. }) => "session",
         Some(Command::Run { .. }) => "run",
         Some(Command::Gateway { .. }) => "gateway",
+        #[cfg(feature = "scheduler")]
         Some(Command::Schedule { .. }) => "schedule",
         #[cfg(feature = "update")]
         Some(Command::Update { .. }) => "update",
@@ -1351,17 +1410,222 @@ fn get_command_name(command: &Option<Command>) -> &'static str {
         Some(Command::Skills { .. }) => "skills",
         Some(Command::Plugin { .. }) => "plugin",
         Some(Command::Term { .. }) => "term",
-        #[cfg(feature = "tui")]
-        Some(Command::Tui { .. }) => "tui",
         #[cfg(feature = "local-inference")]
         Some(Command::LocalModels { .. }) => "local-models",
         Some(Command::Completion { .. }) => "completion",
         Some(Command::Review { .. }) => "review",
         Some(Command::ValidateExtensions { .. }) => "validate-extensions",
+        Some(Command::McpProbe { .. }) => "mcp-probe",
         None => "default_session",
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpProbeScript {
+    #[serde(default)]
+    steps: Vec<McpProbeStep>,
+    elicitation: Option<McpProbeElicitation>,
+    #[serde(default)]
+    oauth: goose::oauth::OAuthFlowConfig,
+    protocol_version: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase")]
+enum McpProbeStep {
+    ListTools,
+    ListPrompts,
+    ListResources,
+    CallTool {
+        name: String,
+        #[serde(default)]
+        arguments: serde_json::Map<String, serde_json::Value>,
+    },
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase")]
+enum McpProbeElicitation {
+    Accept { content: serde_json::Value },
+    AcceptSchemaDefaults,
+    Decline,
+    Cancel,
+}
+
+async fn handle_mcp_probe(extension_command: String, script_path: Option<String>) -> Result<()> {
+    use goose::agents::{Agent, AgentConfig, ToolCallContext};
+    use goose::config::ExtensionConfig;
+    use rmcp::model::{ElicitRequestParams, ElicitResult, ElicitationAction};
+    use tokio_util::sync::CancellationToken;
+
+    let script = if let Some(path) = script_path {
+        let json = if path == "-" {
+            let mut json = String::new();
+            std::io::stdin().read_to_string(&mut json)?;
+            json
+        } else {
+            std::fs::read_to_string(path)?
+        };
+        serde_json::from_str::<McpProbeScript>(&json)?
+    } else {
+        McpProbeScript {
+            steps: vec![
+                McpProbeStep::ListTools,
+                McpProbeStep::ListPrompts,
+                McpProbeStep::ListResources,
+            ],
+            elicitation: None,
+            oauth: goose::oauth::OAuthFlowConfig::default(),
+            protocol_version: None,
+        }
+    };
+
+    let mut extension = if url::Url::parse(&extension_command)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+    {
+        crate::session::CliSession::parse_streamable_http_extension(
+            &extension_command,
+            goose::config::DEFAULT_EXTENSION_TIMEOUT,
+        )
+    } else {
+        crate::session::CliSession::parse_stdio_extension(&extension_command)?
+    };
+    match &mut extension {
+        ExtensionConfig::Stdio { name, .. } | ExtensionConfig::StreamableHttp { name, .. } => {
+            *name = "probe".to_string();
+        }
+        _ => unreachable!("MCP probe only creates stdio or streamable HTTP extensions"),
+    }
+
+    if let Some(client_id) = &script.oauth.client_id {
+        std::env::set_var("GOOSE_MCP_OAUTH_CLIENT_ID", client_id);
+    }
+    if let Some(client_secret) = &script.oauth.client_secret {
+        std::env::set_var("GOOSE_MCP_OAUTH_CLIENT_SECRET", client_secret);
+    }
+    if let Some(client_metadata_url) = &script.oauth.client_metadata_url {
+        std::env::set_var("GOOSE_MCP_OAUTH_CLIENT_METADATA_URL", client_metadata_url);
+    }
+
+    let config = goose::config::Config::global();
+    let mut agent_config = AgentConfig::new(
+        std::sync::Arc::new(SessionManager::instance()),
+        goose::config::permission::PermissionManager::instance(),
+        None,
+        config.get_goose_mode().unwrap_or_default(),
+        true,
+        GoosePlatform::GooseCli,
+    );
+    if let Some(protocol_version) = script.protocol_version.as_deref() {
+        agent_config.mcp_protocol_version = Some(serde_json::from_value(
+            serde_json::Value::String(protocol_version.to_string()),
+        )?);
+    }
+    if let Some(action) = script.elicitation.clone() {
+        agent_config.elicitation_handler =
+            Some(std::sync::Arc::new(move |request| match &action {
+                McpProbeElicitation::Accept { content } => {
+                    ElicitResult::new(ElicitationAction::Accept).with_content(content.clone())
+                }
+                McpProbeElicitation::AcceptSchemaDefaults => {
+                    let content = match request {
+                        ElicitRequestParams::FormElicitationParams {
+                            requested_schema, ..
+                        } => serde_json::to_value(requested_schema)
+                            .ok()
+                            .and_then(|schema| schema.get("properties").cloned())
+                            .and_then(|properties| properties.as_object().cloned())
+                            .map(|properties| {
+                                properties
+                                    .into_iter()
+                                    .filter_map(|(name, schema)| {
+                                        schema.get("default").cloned().map(|value| (name, value))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        _ => serde_json::Map::new(),
+                    };
+                    ElicitResult::new(ElicitationAction::Accept)
+                        .with_content(serde_json::Value::Object(content))
+                }
+                McpProbeElicitation::Decline => ElicitResult::new(ElicitationAction::Decline),
+                McpProbeElicitation::Cancel => ElicitResult::new(ElicitationAction::Cancel),
+            }));
+    }
+    let agent = Agent::with_config(agent_config);
+    let session = agent
+        .config
+        .session_manager
+        .create_session(
+            std::env::current_dir()?,
+            "MCP Probe".to_string(),
+            goose::session::session_manager::SessionType::Hidden,
+            agent.config.goose_mode,
+        )
+        .await?;
+    let session_id = session.id.as_str();
+    agent.add_extension(extension, session_id).await?;
+
+    let mut results = Vec::new();
+    for step in script.steps {
+        let result = match step {
+            McpProbeStep::ListTools => serde_json::json!({
+                "action": "listTools",
+                "result": agent.extension_manager.list_tools_from_extension(
+                    session_id,
+                    "probe",
+                    CancellationToken::new(),
+                ).await?,
+            }),
+            McpProbeStep::ListPrompts => serde_json::json!({
+                "action": "listPrompts",
+                "result": agent.extension_manager.list_prompts_from_extension(
+                    session_id,
+                    "probe",
+                    CancellationToken::new(),
+                ).await?,
+            }),
+            McpProbeStep::ListResources => serde_json::json!({
+                "action": "listResources",
+                "result": agent.extension_manager.list_resources_result_from_extension(
+                    session_id,
+                    "probe",
+                    CancellationToken::new(),
+                ).await?,
+            }),
+            McpProbeStep::CallTool { name, arguments } => {
+                let scoped_name = format!("probe__{name}");
+                let ctx = ToolCallContext::new(
+                    session_id.to_string(),
+                    Some(std::env::current_dir()?),
+                    Some("mcp-probe-tool-call".to_string()),
+                );
+                let result = agent
+                    .extension_manager
+                    .dispatch_tool_call(
+                        &ctx,
+                        rmcp::model::CallToolRequestParams::new(scoped_name)
+                            .with_arguments(arguments),
+                        CancellationToken::new(),
+                    )
+                    .await?
+                    .result
+                    .await?;
+                serde_json::json!({ "action": "callTool", "name": name, "result": result })
+            }
+        };
+        results.push(result);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({ "results": results }))?
+    );
+    Ok(())
+}
+
+#[cfg(feature = "bundled-mcp")]
 async fn handle_mcp_command(server: McpCommand) -> Result<()> {
     let name = server.name();
     let _ = crate::logging::setup_logging(Some(&format!("mcp-{name}")));
@@ -1374,6 +1638,7 @@ async fn handle_mcp_command(server: McpCommand) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "acp-http")]
 struct ServeCommandArgs {
     host: String,
 
@@ -1386,8 +1651,130 @@ struct ServeCommandArgs {
     dangerously_unauthenticated: bool,
     allowed_origins: Vec<String>,
     enable_scheduler: bool,
+    #[cfg(feature = "roaming")]
+    roam: bool,
 }
 
+#[cfg(feature = "roaming")]
+type RoamShareSlot =
+    std::sync::Arc<tokio::sync::RwLock<Option<std::sync::Arc<goose_roaming::RoamingNode>>>>;
+
+#[cfg(feature = "roaming")]
+fn spawn_roam_share(
+    server: std::sync::Arc<goose::acp::server_factory::AcpServer>,
+) -> RoamShareSlot {
+    use crate::commands::roam::try_acquire_roam_lock_owner;
+
+    let slot = RoamShareSlot::default();
+    let task_slot = slot.clone();
+    tokio::spawn(async move {
+        let mut standing_by = false;
+        loop {
+            match try_acquire_roam_lock_owner() {
+                Ok(Some(lock)) => match start_roam_share(server.clone()).await {
+                    Ok(node) => {
+                        *task_slot.write().await = Some(node);
+                        let _lock = lock;
+                        std::future::pending::<()>().await;
+                    }
+                    Err(error) => {
+                        tracing::error!("roam share failed to start: {error}");
+                        drop(lock);
+                    }
+                },
+                Ok(None) => {
+                    if !standing_by {
+                        standing_by = true;
+                        eprintln!(
+                            "another goose process owns the roaming endpoint; standing by to take over if it exits"
+                        );
+                    }
+                }
+                // A real failure (unwritable data dir, filesystem error) will
+                // not fix itself: surface it and stop instead of retrying as
+                // if the endpoint were merely busy.
+                Err(error) => {
+                    eprintln!("roaming disabled: cannot acquire the endpoint lock: {error:#}");
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+    });
+    slot
+}
+
+#[cfg(feature = "roaming")]
+async fn start_roam_share(
+    server: std::sync::Arc<goose::acp::server_factory::AcpServer>,
+) -> Result<std::sync::Arc<goose_roaming::RoamingNode>> {
+    use crate::commands::roam::{
+        directory_path, load_identity, resolve_relay_settings, trust_path,
+    };
+    use crate::commands::roam_full_bridge::FullAcpBridge;
+    use goose::config::paths::Paths;
+    use goose_roaming::{RoamingConfig, RoamingNode, TrustBook};
+    use std::sync::Arc;
+
+    let status_path = Paths::data_dir().join("roam/serve.json");
+    let _ = std::fs::remove_file(&status_path);
+
+    let identity = load_identity()?;
+    let node = RoamingNode::bind(RoamingConfig {
+        identity,
+        relay: resolve_relay_settings()?,
+        trust: TrustBook::new(),
+        trust_path: Some(trust_path()),
+        directory: goose_roaming::Directory::persistent_owned(directory_path()),
+        bind_addr: None,
+        relay_tls: None,
+    })
+    .await?;
+
+    let agent_id = node.endpoint_id().to_string();
+    // Roaming sessions run where `goose serve` was started: the connector's
+    // machine-local path is meaningless on this host, and the serve-wide
+    // server keeps `session_cwd: None` for local ACP clients.
+    let session_cwd =
+        std::env::current_dir().map_err(|e| anyhow::anyhow!("could not determine cwd: {e}"))?;
+    node.share(Arc::new(FullAcpBridge::new(server, agent_id, session_cwd)))
+        .await?;
+
+    if !node.wait_online(std::time::Duration::from_secs(15)).await {
+        tracing::warn!(
+            "roaming endpoint did not come online; the card may lack a reachable address"
+        );
+    }
+
+    let card = node.card();
+    let card_encoded = card.encode()?;
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let status = serde_json::json!({
+        "card": card_encoded,
+        "endpointId": card.endpoint_id.to_string(),
+        "fingerprint": card.fingerprint(),
+        "startedAt": started_at,
+    });
+    if let Some(dir) = status_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp_path = status_path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, serde_json::to_vec_pretty(&status)?)?;
+    std::fs::rename(&tmp_path, &status_path)?;
+
+    eprintln!("roam is enabled for this server");
+    eprintln!("  endpoint id : {}", card.endpoint_id);
+    eprintln!("  fingerprint : {}", card.fingerprint());
+    eprintln!("your connection card (share with a peer so it can reach you):");
+    eprintln!("{card_encoded}");
+
+    Ok(node)
+}
+
+#[cfg(feature = "acp-http")]
 async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
     use axum::http::HeaderValue;
     use goose::acp::server::AcpBuiltinSelection;
@@ -1409,19 +1796,11 @@ async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
         dangerously_unauthenticated,
         allowed_origins,
         enable_scheduler,
+        #[cfg(feature = "roaming")]
+        roam,
     } = args;
 
-    let builtins = if builtins.is_empty() {
-        AcpBuiltinSelection {
-            defaults: vec!["developer".to_string()],
-            explicit: Vec::new(),
-        }
-    } else {
-        AcpBuiltinSelection {
-            defaults: Vec::new(),
-            explicit: builtins,
-        }
-    };
+    let builtins = AcpBuiltinSelection::from_requested(builtins);
 
     let additional_source_roots = Config::global()
         .get_param::<String>("ADDITIONAL_AGENT_SOURCE_ROOTS")
@@ -1437,10 +1816,10 @@ async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
 
     let server = Arc::new(AcpServer::new(AcpServerFactoryConfig {
         builtins,
-        data_dir: Paths::data_dir(),
         config_dir: Paths::config_dir(),
         goose_platform: platform.into(),
         additional_source_roots,
+        session_cwd: None,
         enable_scheduler,
     }));
     let env_secret = std::env::var(GOOSE_SERVER_SECRET_KEY_ENV)
@@ -1474,6 +1853,12 @@ async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
     if let Err(error) = server.start_scheduler().await {
         warn!("Scheduler failed to start; scheduled jobs will not run until a client connects: {error}");
     }
+    #[cfg(feature = "roaming")]
+    let roam_share = if roam {
+        Some(spawn_roam_share(server.clone()))
+    } else {
+        None
+    };
     let router = create_router(
         server,
         secret_key,
@@ -1529,6 +1914,13 @@ async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .await?;
+    }
+
+    #[cfg(feature = "roaming")]
+    if let Some(slot) = roam_share {
+        if let Some(node) = slot.write().await.take() {
+            let _ = node.shutdown().await;
+        }
     }
 
     Ok(())
@@ -1616,6 +2008,7 @@ struct InteractiveSessionArgs {
     fork: bool,
     edit: bool,
     history: bool,
+    system: Option<String>,
     session_opts: SessionOptions,
     extension_opts: ExtensionOptions,
     model_opts: ModelOptions,
@@ -1628,6 +2021,7 @@ async fn handle_interactive_session(args: InteractiveSessionArgs) -> Result<()> 
         fork,
         edit,
         history,
+        system,
         session_opts,
         extension_opts,
         model_opts,
@@ -1705,7 +2099,7 @@ async fn handle_interactive_session(args: InteractiveSessionArgs) -> Result<()> 
         builtins: extension_opts.builtins,
         no_profile: extension_opts.no_profile,
         recipe: None,
-        additional_system_prompt: None,
+        additional_system_prompt: system,
         provider: model_opts.provider,
         model: model_opts.model,
         debug: session_opts.debug,
@@ -1967,7 +2361,10 @@ async fn handle_gateway_command(command: GatewayCommand) -> Result<()> {
             gateway_type,
             bot_token,
         } => {
-            let platform_config = serde_json::json!({ "bot_token": bot_token });
+            let mut platform_config = serde_json::json!({ "bot_token": bot_token });
+            if let Some(ids) = goose::gateway::manager::saved_allowed_user_ids(&gateway_type) {
+                platform_config["allowed_user_ids"] = serde_json::json!(ids);
+            }
             gateway::handle_gateway_start(gateway_type, platform_config).await
         }
         GatewayCommand::Stop { gateway_type } => gateway::handle_gateway_stop(gateway_type).await,
@@ -1975,6 +2372,7 @@ async fn handle_gateway_command(command: GatewayCommand) -> Result<()> {
     }
 }
 
+#[cfg(feature = "scheduler")]
 async fn handle_schedule_command(command: SchedulerCommand) -> Result<()> {
     match command {
         SchedulerCommand::Add {
@@ -2060,19 +2458,195 @@ fn print_download_progress(manager: &goose::download_manager::DownloadManager) {
 }
 
 #[cfg(feature = "local-inference")]
+fn gb_to_bytes(gb: f64) -> Result<u64> {
+    if !gb.is_finite() || gb <= 0.0 {
+        anyhow::bail!("--ram-gb must be a positive number");
+    }
+    Ok((gb * 1024.0 * 1024.0 * 1024.0) as u64)
+}
+
+#[cfg(feature = "local-inference")]
+fn search_query_from_filters(
+    query: Option<String>,
+    repo_prefix: Option<&str>,
+    repo_suffix: Option<&str>,
+) -> String {
+    if let Some(query) = query {
+        return query;
+    }
+
+    if let Some(prefix) = repo_prefix {
+        let term = search_term_from_repo_filter(prefix);
+        if !term.is_empty() {
+            return term;
+        }
+    }
+
+    if let Some(suffix) = repo_suffix {
+        let term = search_term_from_repo_filter(suffix);
+        if !term.is_empty() {
+            return term;
+        }
+    }
+
+    String::new()
+}
+
+#[cfg(feature = "local-inference")]
+fn search_term_from_repo_filter(value: &str) -> String {
+    value
+        .trim_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|c| matches!(c, '-' | '_' | '.'))
+        .to_string()
+}
+
+#[cfg(feature = "local-inference")]
+fn local_search_memory_limit(ram_gb: Option<f64>) -> Result<u64> {
+    if let Some(gb) = ram_gb {
+        return gb_to_bytes(gb);
+    }
+
+    match goose::providers::local_inference::InferenceRuntime::get_or_init() {
+        Ok(runtime) => Ok(
+            goose::providers::local_inference::available_inference_memory_bytes(runtime.as_ref()),
+        ),
+        Err(_) => gb_to_bytes(16.0),
+    }
+}
+
+#[cfg(feature = "local-inference")]
+fn format_size(bytes: u64) -> String {
+    if bytes == 0 {
+        "unknown".to_string()
+    } else {
+        format!("{:.1}GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+#[cfg(feature = "local-inference")]
+fn recommended_variant(
+    model: &goose::providers::local_inference::hf_models::HfModelInfo,
+    available_memory: u64,
+) -> Option<&goose::providers::local_inference::hf_models::HfModelVariant> {
+    use goose::providers::local_inference::hf_models::{recommend_variant, HfQuantVariant};
+
+    let mut variant_indexes = Vec::new();
+    let mut gguf_variants = Vec::new();
+    for (index, variant) in model.variants.iter().enumerate() {
+        if variant.backend_id != "llamacpp" || !variant.supported {
+            continue;
+        }
+        variant_indexes.push(index);
+        gguf_variants.push(HfQuantVariant {
+            quantization: variant.variant_id.clone(),
+            size_bytes: variant.size_bytes,
+            filename: variant.filename.clone().unwrap_or_default(),
+            download_url: variant.download_url.clone().unwrap_or_default(),
+            description: "",
+            quality_rank: variant.quality_rank,
+            sharded: variant.sharded,
+        });
+    }
+
+    recommend_variant(&gguf_variants, available_memory)
+        .map(|index| &model.variants[variant_indexes[index]])
+}
+
+#[cfg(feature = "local-inference")]
 async fn handle_local_models_command(command: LocalModelsCommand) -> Result<()> {
     use goose::providers::local_inference::hf_models;
-    use goose::providers::local_inference::local_model_registry::get_registry;
 
     goose::providers::local_inference::configure_huggingface_auth();
 
     match command {
-        LocalModelsCommand::Search { query, limit } => {
-            println!("Searching HuggingFace for '{}'...", query);
-            let results = hf_models::search_local_models(&query, limit).await?;
+        LocalModelsCommand::Search {
+            query,
+            limit,
+            repo_prefix,
+            repo_suffix,
+            quant,
+            ram_gb,
+            json,
+        } => {
+            let query =
+                search_query_from_filters(query, repo_prefix.as_deref(), repo_suffix.as_deref());
+            if !json {
+                if query.is_empty() {
+                    println!("Searching HuggingFace for local models...");
+                } else {
+                    println!("Searching HuggingFace for '{}'...", query);
+                }
+            }
+            let has_local_filter =
+                repo_prefix.is_some() || repo_suffix.is_some() || quant.is_some();
+            let fetch_limit = if has_local_filter {
+                limit.saturating_mul(5).max(limit).max(50)
+            } else {
+                limit
+            };
+            let mut results = hf_models::search_local_models(&query, fetch_limit).await?;
+            let quant = quant.map(|value| value.to_lowercase());
+            results.retain_mut(|model| {
+                if repo_prefix
+                    .as_deref()
+                    .is_some_and(|prefix| !model.repo_id.starts_with(prefix))
+                {
+                    return false;
+                }
+                if repo_suffix
+                    .as_deref()
+                    .is_some_and(|suffix| !model.repo_id.ends_with(suffix))
+                {
+                    return false;
+                }
+
+                if let Some(quant) = &quant {
+                    model
+                        .variants
+                        .retain(|variant| variant.variant_id.to_lowercase().contains(quant));
+                }
+
+                !model.variants.is_empty()
+            });
+            results.truncate(limit);
 
             if results.is_empty() {
-                println!("No compatible local models found.");
+                if json {
+                    println!("[]");
+                } else {
+                    println!("No compatible local models found.");
+                }
+                return Ok(());
+            }
+
+            let available_memory = local_search_memory_limit(ram_gb)?;
+
+            if json {
+                let output = results
+                    .iter()
+                    .map(|model| {
+                        let recommended_variant =
+                            recommended_variant(model, available_memory).map(|variant| {
+                                serde_json::json!({
+                                    "model_id": variant.model_id,
+                                    "download_id": variant.download_id,
+                                    "label": variant.label,
+                                    "size_bytes": variant.size_bytes,
+                                })
+                            });
+                        serde_json::json!({
+                            "repo_id": model.repo_id,
+                            "author": model.author,
+                            "model_name": model.model_name,
+                            "downloads": model.downloads,
+                            "recommended_variant": recommended_variant,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!("{}", serde_json::to_string_pretty(&output)?);
                 return Ok(());
             }
 
@@ -2081,15 +2655,23 @@ async fn handle_local_models_command(command: LocalModelsCommand) -> Result<()> 
                     "\n{} (by {}) — {} downloads",
                     model.model_name, model.author, model.downloads
                 );
+                if let Some(variant) = recommended_variant(model, available_memory) {
+                    println!(
+                        "  Recommended: {} — {}",
+                        variant.label,
+                        format_size(variant.size_bytes)
+                    );
+                    println!(
+                        "    Download: goose local-models download '{}'",
+                        variant.download_id
+                    );
+                } else {
+                    println!(
+                        "  Recommended: none fits in {}",
+                        format_size(available_memory)
+                    );
+                }
                 for variant in &model.variants {
-                    let size = if variant.size_bytes > 0 {
-                        format!(
-                            "{:.1}GB",
-                            variant.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-                        )
-                    } else {
-                        "unknown".to_string()
-                    };
                     let support = if variant.supported {
                         String::new()
                     } else {
@@ -2103,7 +2685,11 @@ async fn handle_local_models_command(command: LocalModelsCommand) -> Result<()> 
                     };
                     println!(
                         "  [{}] {} — {} — {}{}",
-                        variant.format, variant.label, size, variant.description, support
+                        variant.format,
+                        variant.label,
+                        format_size(variant.size_bytes),
+                        variant.description,
+                        support
                     );
                     if variant.supported {
                         println!(
@@ -2131,7 +2717,7 @@ async fn handle_local_models_command(command: LocalModelsCommand) -> Result<()> 
             let total_size = resolved.total_size();
 
             println!(
-                "\nDownloaded {} ({}). Registering...",
+                "\nDownloaded {} ({})",
                 model_id,
                 if total_size > 0 {
                     format!("{:.1}GB", total_size as f64 / (1024.0 * 1024.0 * 1024.0))
@@ -2139,16 +2725,9 @@ async fn handle_local_models_command(command: LocalModelsCommand) -> Result<()> 
                     "unknown size".to_string()
                 }
             );
-
-            let model_id = hf_models::register_resolved_model(resolved, &spec)?;
-
-            println!("Registered: {}", model_id);
         }
         LocalModelsCommand::List => {
-            let registry = get_registry()
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Failed to acquire registry lock"))?;
-            let models = registry.list_models();
+            let models = hf_models::cached_local_models().await?;
 
             if models.is_empty() {
                 println!("No local models downloaded.");
@@ -2160,23 +2739,13 @@ async fn handle_local_models_command(command: LocalModelsCommand) -> Result<()> 
                 "ID", "Backend", "Variant"
             );
             println!("{}", "-".repeat(88));
-            for m in models {
-                println!(
-                    "{:<50} {:<10} {:<12} {}",
-                    m.id,
-                    m.backend_id.as_deref().unwrap_or("llamacpp"),
-                    m.quantization,
-                    if m.is_downloaded() { "✓" } else { "✗" }
-                );
+            for m in &models {
+                println!("{:<50} {:<10} {:<12} ✓", m.id, m.backend_id, m.quantization);
             }
         }
         LocalModelsCommand::Delete { id } => {
-            let mut registry = get_registry()
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Failed to acquire registry lock"))?;
-
-            if registry.get_model(&id).is_some() {
-                registry.delete_model(&id)?;
+            if hf_models::cached_local_model(&id).await?.is_some() {
+                hf_models::delete_cached_local_model(&id).await?;
                 println!("Deleted model: {}", id);
             } else {
                 println!("Model not found: {}", id);
@@ -2228,6 +2797,7 @@ async fn handle_default_session() -> Result<()> {
 }
 
 pub async fn cli() -> anyhow::Result<()> {
+    #[cfg(feature = "bundled-mcp")]
     register_builtin_extensions(goose_mcp::BUILTIN_EXTENSIONS.clone());
 
     let cli = Cli::parse();
@@ -2248,11 +2818,15 @@ pub async fn cli() -> anyhow::Result<()> {
         Some(Command::Configure {}) => handle_configure().await,
         Some(Command::Doctor {}) => crate::commands::doctor::handle_doctor().await,
         Some(Command::Info { verbose, check }) => handle_info(verbose, check).await,
+        #[cfg(feature = "bundled-mcp")]
         Some(Command::Mcp { server }) => handle_mcp_command(server).await,
         Some(Command::Acp {
             builtins,
             enable_scheduler,
         }) => goose::acp::server::run(builtins, enable_scheduler).await,
+        #[cfg(feature = "roaming")]
+        Some(Command::Roam { command }) => handle_roam_command(command).await,
+        #[cfg(feature = "acp-http")]
         Some(Command::Serve {
             host,
             port,
@@ -2264,6 +2838,8 @@ pub async fn cli() -> anyhow::Result<()> {
             dangerously_unauthenticated,
             allowed_origins,
             enable_scheduler,
+            #[cfg(feature = "roaming")]
+            roam,
         }) => {
             handle_serve_command(ServeCommandArgs {
                 host,
@@ -2276,6 +2852,8 @@ pub async fn cli() -> anyhow::Result<()> {
                 dangerously_unauthenticated,
                 allowed_origins,
                 enable_scheduler,
+                #[cfg(feature = "roaming")]
+                roam,
             })
             .await
         }
@@ -2289,6 +2867,7 @@ pub async fn cli() -> anyhow::Result<()> {
             fork,
             edit,
             history,
+            system,
             session_opts,
             extension_opts,
             model_opts,
@@ -2299,6 +2878,7 @@ pub async fn cli() -> anyhow::Result<()> {
                 fork,
                 edit,
                 history,
+                system,
                 session_opts,
                 extension_opts,
                 model_opts,
@@ -2326,6 +2906,7 @@ pub async fn cli() -> anyhow::Result<()> {
             .await
         }
         Some(Command::Gateway { command }) => handle_gateway_command(command).await,
+        #[cfg(feature = "scheduler")]
         Some(Command::Schedule { command }) => handle_schedule_command(command).await,
         #[cfg(feature = "update")]
         Some(Command::Update {
@@ -2339,8 +2920,6 @@ pub async fn cli() -> anyhow::Result<()> {
         Some(Command::Skills { command }) => handle_skills_subcommand(command).await,
         Some(Command::Plugin { command }) => handle_plugin_subcommand(command),
         Some(Command::Term { command }) => handle_term_subcommand(command).await,
-        #[cfg(feature = "tui")]
-        Some(Command::Tui { args }) => crate::commands::tui::handle_tui(args),
         #[cfg(feature = "local-inference")]
         Some(Command::LocalModels { command }) => handle_local_models_command(command).await,
         Some(Command::Review {
@@ -2395,6 +2974,7 @@ pub async fn cli() -> anyhow::Result<()> {
                 }
             }
         }
+        Some(Command::McpProbe { extension, script }) => handle_mcp_probe(extension, script).await,
         None => handle_default_session().await,
     }
 }
@@ -2474,6 +3054,19 @@ mod tests {
     }
 
     #[test]
+    fn session_accepts_system_prompt() {
+        let cli = Cli::try_parse_from(["goose", "session", "--system", "extra instructions"])
+            .expect("system prompt should work for a new session");
+
+        match cli.command {
+            Some(Command::Session { system, .. }) => {
+                assert_eq!(system.as_deref(), Some("extra instructions"));
+            }
+            _ => panic!("expected session command"),
+        }
+    }
+
+    #[test]
     fn nushell_completion_generation_emits_module() {
         let mut cmd = Cli::command();
         let mut buffer = Vec::new();
@@ -2526,6 +3119,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "acp-http")]
     #[test]
     fn serve_command_accepts_dangerously_unauthenticated_flag() {
         let cli = Cli::try_parse_from([
@@ -2632,15 +3226,66 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "tui")]
-    #[test]
-    fn tui_command_accepts_trailing_args() {
-        let cli =
-            Cli::try_parse_from(["goose", "tui", "--", "--theme", "dark"]).expect("parse failed");
+    #[cfg(feature = "local-inference")]
+    mod local_search {
+        use super::super::{
+            format_size, gb_to_bytes, search_query_from_filters, search_term_from_repo_filter,
+        };
 
-        match cli.command {
-            Some(Command::Tui { args }) => assert_eq!(args, vec!["--theme", "dark"]),
-            _ => panic!("expected tui command"),
+        #[test]
+        fn gb_to_bytes_converts_and_rejects_nonpositive() {
+            assert_eq!(gb_to_bytes(1.0).unwrap(), 1024 * 1024 * 1024);
+            assert_eq!(gb_to_bytes(0.5).unwrap(), 512 * 1024 * 1024);
+            assert!(gb_to_bytes(0.0).is_err());
+            assert!(gb_to_bytes(-4.0).is_err());
+            assert!(gb_to_bytes(f64::NAN).is_err());
+            assert!(gb_to_bytes(f64::INFINITY).is_err());
+        }
+
+        #[test]
+        fn explicit_query_wins_over_repo_filters() {
+            let query = search_query_from_filters(
+                Some("qwen".to_string()),
+                Some("unsloth/Llama-3.2"),
+                Some("-GGUF"),
+            );
+            assert_eq!(query, "qwen");
+        }
+
+        #[test]
+        fn repo_prefix_is_used_when_query_is_absent() {
+            let query = search_query_from_filters(None, Some("unsloth/Llama-3.2"), None);
+            assert_eq!(query, "Llama-3.2");
+        }
+
+        #[test]
+        fn repo_suffix_is_used_when_prefix_yields_nothing() {
+            let query = search_query_from_filters(None, Some("///"), Some("-Qwen3-GGUF"));
+            assert_eq!(query, "Qwen3-GGUF");
+        }
+
+        #[test]
+        fn empty_when_nothing_is_provided() {
+            assert_eq!(search_query_from_filters(None, None, None), "");
+        }
+
+        #[test]
+        fn repo_filter_takes_last_path_segment_and_trims_separators() {
+            assert_eq!(
+                search_term_from_repo_filter("unsloth/Llama-3.2"),
+                "Llama-3.2"
+            );
+            assert_eq!(search_term_from_repo_filter("-GGUF"), "GGUF");
+            assert_eq!(search_term_from_repo_filter("/bartowski/"), "bartowski");
+            assert_eq!(search_term_from_repo_filter("_model_."), "model");
+            assert_eq!(search_term_from_repo_filter(""), "");
+        }
+
+        #[test]
+        fn format_size_reports_unknown_for_zero() {
+            assert_eq!(format_size(0), "unknown");
+            assert_eq!(format_size(1024 * 1024 * 1024), "1.0GB");
+            assert_eq!(format_size(3 * 1024 * 1024 * 1024 / 2), "1.5GB");
         }
     }
 }

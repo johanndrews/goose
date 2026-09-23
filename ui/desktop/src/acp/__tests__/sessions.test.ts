@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { getAcpClient } from '../acpConnection';
 import {
   acpGetSessionListItem,
+  acpListSessions,
   acpLoadSession,
   acpNewSession,
   sessionInfoToSession,
@@ -27,6 +28,23 @@ function sessionInfo(overrides: Partial<SessionInfo> = {}): SessionInfo {
   } as unknown as SessionInfo;
 }
 
+function newSessionClient() {
+  const client = {
+    connection: {
+      agent: {
+        request: vi.fn().mockResolvedValue({ sessionId: 'session-1' }),
+      },
+    },
+    goose: {
+      sessionInfo_unstable: vi.fn().mockResolvedValue({ session: sessionInfo() }),
+    },
+  };
+  vi.mocked(getAcpClient).mockResolvedValue(
+    client as unknown as Awaited<ReturnType<typeof getAcpClient>>
+  );
+  return client;
+}
+
 describe('ACP sessions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -42,6 +60,29 @@ describe('ACP sessions', () => {
     const session = sessionInfoToSession(sessionInfo({ title: undefined }));
 
     expect(session.name).toBe('');
+  });
+
+  it('only requests acp session types when explicitly included', async () => {
+    const client = {
+      connection: {
+        agent: {
+          request: vi.fn().mockResolvedValue({ sessions: [] }),
+        },
+      },
+    };
+    vi.mocked(getAcpClient).mockResolvedValue(
+      client as unknown as Awaited<ReturnType<typeof getAcpClient>>
+    );
+
+    await acpListSessions();
+    expect(client.connection.agent.request).toHaveBeenLastCalledWith(methods.agent.session.list, {
+      _meta: { types: ['user', 'scheduled'] },
+    });
+
+    await acpListSessions(undefined, { includeAcp: true });
+    expect(client.connection.agent.request).toHaveBeenLastCalledWith(methods.agent.session.list, {
+      _meta: { types: ['user', 'scheduled', 'acp'] },
+    });
   });
 
   it('returns session info refreshed after loading the ACP session', async () => {
@@ -85,6 +126,33 @@ describe('ACP sessions', () => {
     );
   });
 
+  it('sends an explicitly empty extension set as an empty list', async () => {
+    const client = newSessionClient();
+
+    await acpNewSession('/tmp', []);
+
+    expect(client.connection.agent.request).toHaveBeenCalledWith(methods.agent.session.new, {
+      cwd: '/tmp',
+      mcpServers: [],
+      _meta: {
+        client: 'goose-desktop',
+        enabledExtensions: [],
+      },
+    });
+  });
+
+  it('omits the extension key when the caller names no set', async () => {
+    const client = newSessionClient();
+
+    await acpNewSession('/tmp', undefined);
+
+    expect(client.connection.agent.request).toHaveBeenCalledWith(methods.agent.session.new, {
+      cwd: '/tmp',
+      mcpServers: [],
+      _meta: { client: 'goose-desktop' },
+    });
+  });
+
   it('carries the recipe parameter scope id in new-session metadata', async () => {
     const createdSessionInfo = sessionInfo();
     const client = {
@@ -101,7 +169,7 @@ describe('ACP sessions', () => {
       client as unknown as Awaited<ReturnType<typeof getAcpClient>>
     );
 
-    await acpNewSession('/tmp', [], {
+    await acpNewSession('/tmp', undefined, {
       recipeDeeplink: 'goose://recipe?url=example',
       recipeParameterScopeId: 'scope-1',
     });

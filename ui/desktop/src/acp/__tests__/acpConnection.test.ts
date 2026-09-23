@@ -37,7 +37,7 @@ const transport = vi.hoisted(() => ({
   createWebSocketStream: vi.fn(),
 }));
 
-vi.mock('@aaif/goose-sdk', () => ({
+vi.mock('@aaif/goose-acp-client', () => ({
   DEFAULT_GOOSE_MCP_HOST_CAPABILITIES: {},
 }));
 
@@ -76,6 +76,10 @@ describe('ACP connection ownership', () => {
     expect(first).toBe(second);
     expect(mockClientFactory.instances).toHaveLength(1);
     expect(mockClientFactory.initialize).toHaveBeenCalledTimes(1);
+    expect(mockClientFactory.initialize).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ protocolVersion: 1 })
+    );
     expect(transport.createWebSocketStream).toHaveBeenCalledWith('ws://localhost/acp', {
       protocols: [],
     });

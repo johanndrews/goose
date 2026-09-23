@@ -10,6 +10,7 @@ import { ChatState } from '../types/chatState';
 import debounce from 'lodash/debounce';
 import { LocalMessageStorage } from '../utils/localMessageStorage';
 import { DirSwitcher } from './bottom_menu/DirSwitcher';
+import { GitBranchIndicator } from './GitBranchIndicator';
 import ModelsBottomBar from './settings/models/bottom_bar/ModelsBottomBar';
 import { BottomMenuExtensionSelection } from './bottom_menu/BottomMenuExtensionSelection';
 import { cn } from '../utils';
@@ -17,6 +18,7 @@ import { AlertType, useAlerts } from './alerts';
 import { useModelAndProvider } from './ModelAndProviderContext';
 import { acpGetProviderDetails } from '../acp/providers';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
+import { useFocusOnTyping } from '../hooks/useFocusOnTyping';
 import { toastError } from '../toasts';
 import MentionPopover, { DisplayItemWithMatch } from './MentionPopover';
 import { COST_TRACKING_ENABLED } from '../updates';
@@ -35,9 +37,13 @@ import { getNavigationShortcutText } from '../utils/keyboardShortcuts';
 import { UserInput, ImageData } from '../types/message';
 import { compressImageDataUrl } from '../utils/conversionUtils';
 import { fetchCanonicalModelInfo } from '../utils/canonical';
+import { getTextDirection } from '../utils/textDirection';
 import { defineMessages, useIntl } from '../i18n';
 import TurndownService from 'turndown';
 import type { NextChatExtensionDraft } from '../utils/nextChatExtensions';
+import { LiveVoiceButton } from './LiveVoiceButton';
+import type { LiveVoiceAvailabilityResponse_unstable } from '@aaif/goose-acp-client';
+import { isLiveVoiceActive, type LiveVoiceController } from '../liveVoice/useLiveVoice';
 
 const turndown = new TurndownService({
   headingStyle: 'atx',
@@ -66,6 +72,15 @@ interface PastedImage {
   error?: string;
 }
 
+type ChatInputLiveVoice = Pick<
+  LiveVoiceController,
+  'phase' | 'muted' | 'stop' | 'toggleMute'
+> & {
+  availability: LiveVoiceAvailabilityResponse_unstable | null;
+  activeInAnotherSession: boolean;
+  start: () => Promise<void>;
+};
+
 const moveQueuedMessageToFront = (
   messages: QueuedMessage[],
   messageId: string
@@ -80,7 +95,7 @@ const removeQueuedMessage = (messages: QueuedMessage[], messageId: string): Queu
 
 const MAX_IMAGES_PER_MESSAGE = 10;
 
-const TOKEN_LIMIT_DEFAULT = 128000; // fallback for custom models that the backend doesn't know about
+const TOKEN_LIMIT_DEFAULT = 128000; // used before a session has a backend-resolved limit
 
 const getContextAlertType = (totalTokens: number, tokenLimit: number): AlertType => {
   const percentage = tokenLimit ? (totalTokens / tokenLimit) * 100 : 0;
@@ -160,16 +175,24 @@ interface ChatInputProps {
   sessionId: string | null;
   handleSubmit: (input: UserInput) => void;
   chatState: ChatState;
+  hasActiveRun: boolean;
   onStop?: () => void;
   onSteerQueuedMessage?: (input: UserInput) => Promise<boolean>;
   pauseQueueOnStop?: boolean;
   queueProcessingBlocked?: boolean;
   commandHistory?: string[];
   initialValue?: string;
+  /**
+   * Unsent input, held above the route outlet so it outlives the unmount.
+   * Only New Chat passes it: every other chat stays mounted in
+   * `ChatSessionsContainer` and keeps its text in local state.
+   */
+  draftRef?: React.RefObject<string>;
   droppedFiles?: DroppedFile[];
   onFilesProcessed?: () => void;
   setView: (view: View) => void;
   totalTokens?: number;
+  contextLimit?: number;
   accumulatedInputTokens?: number;
   accumulatedOutputTokens?: number;
   accumulatedCost?: number | null;
@@ -177,7 +200,6 @@ interface ChatInputProps {
   disableAnimation?: boolean;
   recipe?: Recipe | null;
   recipeId?: string | null;
-  recipeAccepted?: boolean;
   initialPrompt?: string;
   append?: (message: Message) => void;
   onWorkingDirChange?: (newDir: string) => Promise<void> | void;
@@ -189,22 +211,26 @@ interface ChatInputProps {
   latestInference?: Message['metadata']['inference'] | null;
   nextChatExtensionDraft?: NextChatExtensionDraft;
   onNextChatExtensionDraftChange?: (draft: NextChatExtensionDraft) => void;
+  liveVoice?: ChatInputLiveVoice;
 }
 
 export default function ChatInput({
   sessionId,
   handleSubmit,
   chatState = ChatState.Idle,
+  hasActiveRun,
   onStop,
   onSteerQueuedMessage,
   pauseQueueOnStop = false,
   queueProcessingBlocked = false,
   commandHistory = [],
   initialValue = '',
+  draftRef,
   droppedFiles = [],
   onFilesProcessed,
   setView,
   totalTokens,
+  contextLimit,
   accumulatedInputTokens,
   accumulatedOutputTokens,
   accumulatedCost,
@@ -212,7 +238,6 @@ export default function ChatInput({
   disableAnimation = false,
   recipe: _recipe,
   recipeId: _recipeId,
-  recipeAccepted,
   initialPrompt,
   append: _append,
   onWorkingDirChange,
@@ -224,6 +249,7 @@ export default function ChatInput({
   latestInference,
   nextChatExtensionDraft,
   onNextChatExtensionDraftChange,
+  liveVoice,
 }: ChatInputProps) {
   const [_value, setValue] = useState(initialValue);
   const [displayValue, setDisplayValue] = useState(initialValue); // For immediate visual feedback
@@ -231,13 +257,29 @@ export default function ChatInput({
   const [pastedImages, setPastedImages] = useState<PastedImage[]>([]);
   const [isFilePickerOpen, setIsFilePickerOpen] = useState(false);
 
+  // Every path that puts text in the input goes through here, so the draft cannot
+  // miss one: typing, dictation, link paste, history, file and mention insertion.
+  const applyInputValue = useCallback(
+    (next: string) => {
+      setDisplayValue(next);
+      setValue(next);
+      if (draftRef) {
+        draftRef.current = next;
+      }
+    },
+    [draftRef]
+  );
+
   // Derived state - chatState != Idle means we're in some form of loading state
   const isLoading = chatState !== ChatState.Idle;
-  const isLoadingRef = useRef(isLoading);
+  const liveVoiceBlocksSubmission = liveVoice ? isLiveVoiceActive(liveVoice.phase) : false;
+  const isSubmissionBusy = isLoading || hasActiveRun || liveVoiceBlocksSubmission;
+  const isSubmissionBusyRef = useRef(isSubmissionBusy);
+  const composerDir = useMemo(() => getTextDirection(displayValue) ?? undefined, [displayValue]);
   const queueProcessingBlockedRef = useRef(queueProcessingBlocked);
-  const wasLoadingRef = useRef(isLoading);
+  const wasSubmissionBusyRef = useRef(isSubmissionBusy);
   const wasQueueProcessingBlockedRef = useRef(queueProcessingBlocked);
-  isLoadingRef.current = isLoading;
+  isSubmissionBusyRef.current = isSubmissionBusy;
   queueProcessingBlockedRef.current = queueProcessingBlocked;
 
   // Queue functionality - ephemeral, only exists in memory for this chat instance
@@ -368,12 +410,12 @@ export default function ChatInput({
 
   // Queue processing
   useEffect(() => {
-    const becameIdle = wasLoadingRef.current && !isLoading;
+    const becameAvailable = wasSubmissionBusyRef.current && !isSubmissionBusy;
     const becameUnblocked = wasQueueProcessingBlockedRef.current && !queueProcessingBlocked;
     const hasSendNowInFlight = sendNowInFlightMessageIdsRef.current.size > 0;
 
     if (
-      (becameIdle || (becameUnblocked && !isLoading)) &&
+      (becameAvailable || (becameUnblocked && !isSubmissionBusy)) &&
       !queueProcessingBlocked &&
       !hasSendNowInFlight &&
       queuedMessages.length > 0
@@ -385,13 +427,13 @@ export default function ChatInput({
 
       if (pendingSendAfterStopId && !messageToSend) {
         clearPendingSendAfterStop(pendingSendAfterStopId);
-        wasLoadingRef.current = isLoading;
+        wasSubmissionBusyRef.current = isSubmissionBusy;
         wasQueueProcessingBlockedRef.current = queueProcessingBlocked;
         return;
       }
 
       if (!messageToSend) {
-        wasLoadingRef.current = isLoading;
+        wasSubmissionBusyRef.current = isSubmissionBusy;
         wasQueueProcessingBlockedRef.current = queueProcessingBlocked;
         return;
       }
@@ -427,10 +469,10 @@ export default function ChatInput({
         }
       }
     }
-    wasLoadingRef.current = isLoading;
+    wasSubmissionBusyRef.current = isSubmissionBusy;
     wasQueueProcessingBlockedRef.current = queueProcessingBlocked;
   }, [
-    isLoading,
+    isSubmissionBusy,
     queueProcessingBlocked,
     queuedMessages,
     handleSubmit,
@@ -488,8 +530,7 @@ export default function ChatInput({
           ? `${displayValue.trim()} ${cleanedText}`
           : displayValue.trim() || cleanedText;
 
-      setDisplayValue(newValue);
-      setValue(newValue);
+      applyInputValue(newValue);
 
       if (shouldAutoSubmit && newValue.trim()) {
         trackVoiceDictation('auto_submit');
@@ -514,25 +555,28 @@ export default function ChatInput({
   const timeoutRefsRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
 
   useEffect(() => {
-    setValue(initialValue);
-    setDisplayValue(initialValue);
+    // The draft is restored here rather than through `initialValue`, because this
+    // effect also runs on mount and would overwrite a value seeded into `useState`.
+    // It stays a ref for the same reason: a prop that changed on every keystroke
+    // would re-run this effect and reset the state it clears below.
+    const restored = draftRef?.current || initialValue;
+    setValue(restored);
+    setDisplayValue(restored);
     setPastedImages([]);
     setHistoryIndex(-1);
     setIsInGlobalHistory(false);
     setHasUserTyped(false);
-  }, [initialValue]);
+  }, [initialValue, draftRef]);
 
-  // Handle recipe prompt updates
   useEffect(() => {
-    // If recipe is accepted and we have an initial prompt, and no messages yet, and we haven't set it before
-    if (recipeAccepted && initialPrompt && messages.length === 0) {
+    if (initialPrompt && messages.length === 0) {
       setDisplayValue(initialPrompt);
       setValue(initialPrompt);
       setTimeout(() => {
         textAreaRef.current?.focus();
       }, 0);
     }
-  }, [recipeAccepted, initialPrompt, messages.length, textAreaRef]);
+  }, [initialPrompt, messages.length, textAreaRef]);
 
   const [isComposing, setIsComposing] = useState(false);
   const [historyIndex, setHistoryIndex] = useState(-1);
@@ -574,10 +618,16 @@ export default function ChatInput({
     }
   }, [textAreaRef]);
 
+  useFocusOnTyping(textAreaRef, !isRecording);
+
   // Load providers and get current model's token limit
   const loadProviderDetails = async () => {
     try {
-      // Reset token limit loaded state
+      if (sessionId) {
+        setTokenLimit(0);
+        setIsTokenLimitLoaded(false);
+        return;
+      }
       setIsTokenLimitLoaded(false);
 
       // Use effective model/provider (includes overrides from in-session model changes),
@@ -638,7 +688,20 @@ export default function ChatInput({
   useEffect(() => {
     loadProviderDetails();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [effectiveModel, effectiveProvider, configModel, configProvider]);
+  }, [effectiveModel, effectiveProvider, configModel, configProvider, sessionId]);
+
+  useEffect(() => {
+    if (contextLimit === undefined) {
+      if (sessionId) {
+        setTokenLimit(0);
+        setIsTokenLimitLoaded(false);
+      }
+      return;
+    }
+
+    setTokenLimit(contextLimit);
+    setIsTokenLimitLoaded(true);
+  }, [contextLimit, sessionId]);
 
   // Handle token usage alerts
   useEffect(() => {
@@ -684,11 +747,6 @@ export default function ChatInput({
 
   const maxHeight = 10 * 24;
 
-  // Immediate function to update actual value - no debounce for better responsiveness
-  const updateValue = React.useCallback((value: string) => {
-    setValue(value);
-  }, []);
-
   const minTextareaHeight = 38;
 
   const debouncedAutosize = useMemo(
@@ -726,8 +784,7 @@ export default function ChatInput({
     const val = evt.target.value;
     const cursorPosition = evt.target.selectionStart;
 
-    setDisplayValue(val);
-    updateValue(val);
+    applyInputValue(val);
     setHasUserTyped(true);
     checkForMentionOrSlash(val, cursorPosition, evt.target);
   };
@@ -823,13 +880,22 @@ export default function ChatInput({
     setDisplayValue('');
     setValue('');
     setPastedImages([]);
+    if (draftRef) {
+      draftRef.current = '';
+    }
     if (onFilesProcessed && droppedFiles.length > 0) {
       onFilesProcessed();
     }
     if (localDroppedFiles.length > 0) {
       setLocalDroppedFiles([]);
     }
-  }, [droppedFiles.length, localDroppedFiles.length, onFilesProcessed, setLocalDroppedFiles]);
+  }, [
+    draftRef,
+    droppedFiles.length,
+    localDroppedFiles.length,
+    onFilesProcessed,
+    setLocalDroppedFiles,
+  ]);
 
   const handlePaste = async (evt: React.ClipboardEvent<HTMLTextAreaElement>) => {
     if (isRecording) return;
@@ -853,8 +919,7 @@ export default function ChatInput({
               const newValue =
                 displayValue.substring(0, start) + markdown + displayValue.substring(end);
               const cursorPos = start + markdown.length;
-              setDisplayValue(newValue);
-              updateValue(newValue);
+              applyInputValue(newValue);
               setHasUserTyped(true);
               checkForMentionOrSlash(newValue, cursorPos, textarea);
               requestAnimationFrame(() => {
@@ -1017,27 +1082,21 @@ export default function ChatInput({
     // Update display if we have a new value
     if (newIndex !== historyIndex) {
       setHistoryIndex(newIndex);
-      if (newIndex === -1) {
-        setDisplayValue(savedInput || '');
-        setValue(savedInput || '');
-      } else {
-        setDisplayValue(newValue || '');
-        setValue(newValue || '');
-      }
+      applyInputValue((newIndex === -1 ? savedInput : newValue) || '');
       // Reset hasUserTyped when we populate from history
       setHasUserTyped(false);
     }
   };
 
   const handleInterruptionAndQueue = () => {
-    if (!isLoading || !hasSubmittableContent) {
+    if (!isSubmissionBusy || !hasSubmittableContent) {
       return false;
     }
 
     const imageData = convertImagesToImageData();
     const contentToQueue = appendDroppedFilePaths(displayValue.trim());
 
-    const interruptionMatch = detectInterruption(displayValue.trim());
+    const interruptionMatch = isLoading ? detectInterruption(displayValue.trim()) : null;
 
     if (interruptionMatch && interruptionMatch.shouldInterrupt) {
       setLastInterruption(interruptionMatch.matchedText);
@@ -1080,7 +1139,7 @@ export default function ChatInput({
   };
 
   const canSubmit =
-    !isLoading &&
+    !isSubmissionBusy &&
     !queueProcessingBlocked &&
     (displayValue.trim() ||
       pastedImages.some((img) => img.dataUrl && !img.error && !img.isLoading) ||
@@ -1180,9 +1239,7 @@ export default function ChatInput({
       }
 
       if (evt.altKey) {
-        const newValue = displayValue + '\n';
-        setDisplayValue(newValue);
-        setValue(newValue);
+        applyInputValue(displayValue + '\n');
         return;
       }
 
@@ -1204,12 +1261,12 @@ export default function ChatInput({
     if (queueProcessingBlocked) {
       return;
     }
-    if (isLoading && hasSubmittableContent) {
+    if (isSubmissionBusy && hasSubmittableContent) {
       handleInterruptionAndQueue();
       return;
     }
     const canSubmit =
-      !isLoading &&
+      !isSubmissionBusy &&
       !queueProcessingBlocked &&
       (displayValue.trim() ||
         pastedImages.some((img) => img.dataUrl && !img.error && !img.isLoading) ||
@@ -1282,9 +1339,7 @@ export default function ChatInput({
     } else {
       trackFileAttached('file');
       const path = window.electron.getPathForFile(file);
-      const newValue = displayValue.trim() ? `${displayValue.trim()} ${path}` : path;
-      setDisplayValue(newValue);
-      setValue(newValue);
+      applyInputValue(displayValue.trim() ? `${displayValue.trim()} ${path}` : path);
     }
 
     textAreaRef.current?.focus();
@@ -1302,8 +1357,7 @@ export default function ChatInput({
     );
     const newValue = `${beforeMention}${itemText}${afterMention}`;
 
-    setDisplayValue(newValue);
-    setValue(newValue);
+    applyInputValue(newValue);
     setMentionPopover((prev) => ({ ...prev, isOpen: false }));
     textAreaRef.current?.focus();
 
@@ -1322,7 +1376,6 @@ export default function ChatInput({
     allDroppedFiles.some((file) => !file.error && !file.isLoading);
   const isAnyImageLoading = pastedImages.some((img) => img.isLoading);
   const isAnyDroppedFileLoading = allDroppedFiles.some((file) => file.isLoading);
-
   const isSubmitButtonDisabled =
     !hasSubmittableContent ||
     isAnyImageLoading ||
@@ -1375,7 +1428,7 @@ export default function ChatInput({
     if (!messageToSend) return;
     if (queueProcessingBlocked) return;
 
-    if (!isLoading) {
+    if (!isSubmissionBusy) {
       setQueuedMessages((prev) => removeQueuedMessage(prev, messageId));
       LocalMessageStorage.addMessage(messageToSend.content);
       handleSubmit({ msg: messageToSend.content, images: messageToSend.images });
@@ -1414,7 +1467,7 @@ export default function ChatInput({
         setSendNowInFlightMessage(messageId, false);
       }
 
-      if (!isLoadingRef.current && !queueProcessingBlockedRef.current) {
+      if (!isSubmissionBusyRef.current && !queueProcessingBlockedRef.current) {
         queuePausedRef.current = wasQueuePausedBeforeSteer;
         setQueuedMessages((prev) => {
           const newQueue = removeQueuedMessage(prev, messageId);
@@ -1445,7 +1498,7 @@ export default function ChatInput({
   const handleResumeQueue = () => {
     queuePausedRef.current = false;
     setLastInterruption(null);
-    if (!isLoading && !queueProcessingBlocked && queuedMessages.length > 0) {
+    if (!isSubmissionBusy && !queueProcessingBlocked && queuedMessages.length > 0) {
       const nextMessage = queuedMessages[0];
       LocalMessageStorage.addMessage(nextMessage.content);
       handleSubmit({ msg: nextMessage.content, images: nextMessage.images });
@@ -1504,6 +1557,7 @@ export default function ChatInput({
             data-testid="chat-input"
             autoFocus
             id="dynamic-textarea"
+            dir={composerDir}
             placeholder={isRecording ? '' : getNavigationShortcutText(intl)}
             value={displayValue}
             onChange={handleChange}
@@ -1515,7 +1569,7 @@ export default function ChatInput({
             onBlur={() => setIsFocused(false)}
             ref={textAreaRef}
             rows={1}
-            readOnly={isRecording}
+            readOnly={isRecording || liveVoiceBlocksSubmission}
             style={{
               minHeight: `${minTextareaHeight}px`,
               maxHeight: `${maxHeight}px`,
@@ -1683,6 +1737,10 @@ export default function ChatInput({
           />
         )}
 
+        {!isBottomBarNarrow && currentWorkingDir && (
+          <GitBranchIndicator dir={currentWorkingDir} className="ml-1" />
+        )}
+
         {/* Spacer */}
         <div className="flex-1" />
 
@@ -1756,6 +1814,23 @@ export default function ChatInput({
               <TooltipContent>Attach file</TooltipContent>
             </Tooltip>
           </>
+        )}
+
+        {liveVoice && (
+          <LiveVoiceButton
+            availability={liveVoice.availability}
+            phase={liveVoice.phase}
+            muted={liveVoice.muted}
+            activeInAnotherSession={liveVoice.activeInAnotherSession}
+            onStart={() => void liveVoice.start()}
+            onStop={() => void liveVoice.stop()}
+            onToggleMute={liveVoice.toggleMute}
+            composerEmpty={
+              displayValue.trim().length === 0 &&
+              pastedImages.length === 0 &&
+              allDroppedFiles.length === 0
+            }
+          />
         )}
 
         {/* Right: mic — ghost icon, no background when idle */}
