@@ -1,5 +1,8 @@
 use crate::{
-    agents::{subagent_task_config::TaskConfig, Agent, AgentConfig, AgentEvent, SessionConfig},
+    agents::{
+        state_machine::MAX_TURNS_MESSAGE, subagent_task_config::TaskConfig, Agent, AgentConfig,
+        AgentEvent, SessionConfig,
+    },
     conversation::{
         message::{Message, MessageContent},
         Conversation,
@@ -13,6 +16,7 @@ use rmcp::model::{ErrorCode, ErrorData, Notification, ServerNotification};
 #[expect(deprecated)]
 use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
 use serde::Serialize;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -29,8 +33,37 @@ pub struct SubagentPromptContext {
     pub available_tools: String,
 }
 
-type AgentMessagesFuture =
-    Pin<Box<dyn Future<Output = Result<(Conversation, Option<String>)>> + Send>>;
+/// A subagent run that did not reach normal completion (turn limit, an
+/// error on its reply stream, or cancellation). Carries the reason plus
+/// whatever output the subagent produced before stopping, so the parent
+/// still gets useful partial context.
+#[derive(Debug)]
+pub struct SubagentIncomplete {
+    pub reason: String,
+    pub partial_output: String,
+}
+
+impl fmt::Display for SubagentIncomplete {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.reason)?;
+        if !self.partial_output.is_empty() {
+            write!(f, "\n\n{}", self.partial_output)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SubagentIncomplete {}
+
+struct SubagentRunOutcome {
+    conversation: Conversation,
+    final_output: Option<String>,
+    max_turns: usize,
+    stream_error: Option<anyhow::Error>,
+    cancelled: bool,
+}
+
+type AgentMessagesFuture = Pin<Box<dyn Future<Output = Result<SubagentRunOutcome>> + Send>>;
 
 pub struct SubagentRunParams {
     pub config: AgentConfig,
@@ -45,7 +78,7 @@ pub struct SubagentRunParams {
 
 pub async fn run_subagent_task(params: SubagentRunParams) -> Result<String, anyhow::Error> {
     let return_last_only = params.return_last_only;
-    let (messages, final_output) = get_agent_messages(params).await.map_err(|e| {
+    let outcome = get_agent_messages(params).await.map_err(|e| {
         ErrorData::new(
             ErrorCode::INTERNAL_ERROR,
             format!("Failed to execute task: {}", e),
@@ -53,11 +86,51 @@ pub async fn run_subagent_task(params: SubagentRunParams) -> Result<String, anyh
         )
     })?;
 
-    if let Some(output) = final_output {
+    classify_outcome(outcome, return_last_only)
+}
+
+fn classify_outcome(
+    outcome: SubagentRunOutcome,
+    return_last_only: bool,
+) -> Result<String, anyhow::Error> {
+    if let Some(output) = outcome.final_output {
         return Ok(output);
     }
 
-    Ok(extract_response_text(&messages, return_last_only))
+    let incomplete_reason = if let Some(stream_error) = outcome.stream_error {
+        Some(format!(
+            "Subagent's reply stream ended with an error: {stream_error}"
+        ))
+    } else if outcome.cancelled {
+        Some("Subagent was cancelled before finishing.".to_string())
+    } else if is_max_turns_message(&outcome.conversation) {
+        Some(format!(
+            "Subagent stopped after reaching its turn limit ({} turns) before finishing.",
+            outcome.max_turns
+        ))
+    } else {
+        None
+    };
+
+    if let Some(reason) = incomplete_reason {
+        return Err(SubagentIncomplete {
+            reason,
+            partial_output: extract_response_text(&outcome.conversation, false),
+        }
+        .into());
+    }
+
+    Ok(extract_response_text(
+        &outcome.conversation,
+        return_last_only,
+    ))
+}
+
+fn is_max_turns_message(conversation: &Conversation) -> bool {
+    conversation.messages().last().is_some_and(|message| {
+        message.role == rmcp::model::Role::Assistant
+            && message.as_concat_text() == MAX_TURNS_MESSAGE
+    })
 }
 
 fn extract_response_text(messages: &Conversation, return_last_only: bool) -> String {
@@ -193,6 +266,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             retry_config: recipe.retry,
         };
 
+        let cancellation_check = cancellation_token.clone();
         let mut stream =
             crate::session_context::with_session_id(Some(session_id.to_string()), async {
                 agent
@@ -207,6 +281,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             .await
             .map_err(|e| anyhow!("Failed to get reply from agent: {}", e))?;
 
+        let mut stream_error = None;
         while let Some(message_result) = stream.next().await {
             match message_result {
                 Ok(AgentEvent::Message(msg)) => {
@@ -235,14 +310,22 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
                 }
                 Err(e) => {
                     tracing::error!("Error receiving message from subagent: {}", e);
+                    stream_error = Some(e);
                     break;
                 }
             }
         }
 
         let final_output = get_final_output(&agent, has_response_schema).await;
+        let cancelled = cancellation_check.is_some_and(|token| token.is_cancelled());
 
-        Ok((conversation, final_output))
+        Ok(SubagentRunOutcome {
+            conversation,
+            final_output,
+            max_turns,
+            stream_error,
+            cancelled,
+        })
     })
 }
 
@@ -316,10 +399,20 @@ pub fn create_tool_notification(
 
 #[cfg(test)]
 mod tests {
-    use super::{create_tool_notification, SUBAGENT_TOOL_REQUEST_TYPE};
+    use super::*;
+    use crate::agents::{AgentConfig, GoosePlatform};
+    use crate::config::permission::PermissionManager;
+    use crate::config::GooseMode;
     use crate::conversation::message::MessageContent;
-    use rmcp::model::{CallToolRequestParams, ServerNotification};
+    use crate::providers::base::{stream_from_single_message, MessageStream, Provider};
+    use crate::recipe::Recipe;
+    use crate::session::session_manager::SessionType;
+    use crate::session::SessionManager;
+    use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
+    use goose_providers::errors::ProviderError;
+    use rmcp::model::{CallToolRequestParams, ServerNotification, Tool};
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     #[expect(deprecated)]
@@ -360,5 +453,298 @@ mod tests {
     fn create_tool_notification_ignores_non_tool_request() {
         let content = MessageContent::text("hello");
         assert!(create_tool_notification(&content, "session_1").is_none());
+    }
+
+    fn conversation_ending_with(last: Message) -> Conversation {
+        Conversation::new_unvalidated(vec![
+            Message::user().with_text("do the thing"),
+            Message::assistant().with_text("working on it"),
+            last,
+        ])
+    }
+
+    #[test]
+    fn is_max_turns_message_matches_trailing_assistant_notice() {
+        let conversation =
+            conversation_ending_with(Message::assistant().with_text(MAX_TURNS_MESSAGE));
+        assert!(is_max_turns_message(&conversation));
+    }
+
+    #[test]
+    fn is_max_turns_message_ignores_unrelated_final_text() {
+        let conversation = conversation_ending_with(Message::assistant().with_text("all done"));
+        assert!(!is_max_turns_message(&conversation));
+    }
+
+    #[test]
+    fn is_max_turns_message_ignores_non_assistant_trailing_message() {
+        let conversation = conversation_ending_with(
+            Message::user().with_text(MAX_TURNS_MESSAGE), // wrong role
+        );
+        assert!(!is_max_turns_message(&conversation));
+    }
+
+    fn base_outcome(conversation: Conversation) -> SubagentRunOutcome {
+        SubagentRunOutcome {
+            conversation,
+            final_output: None,
+            max_turns: 2,
+            stream_error: None,
+            cancelled: false,
+        }
+    }
+
+    #[test]
+    fn classify_outcome_reports_turn_limit_as_error_with_partial_text() {
+        let conversation =
+            conversation_ending_with(Message::assistant().with_text(MAX_TURNS_MESSAGE));
+        let outcome = base_outcome(conversation);
+
+        let err = classify_outcome(outcome, true).expect_err("must not report success");
+        let incomplete = err
+            .downcast_ref::<SubagentIncomplete>()
+            .expect("error must be a SubagentIncomplete");
+        assert_eq!(
+            incomplete.reason,
+            "Subagent stopped after reaching its turn limit (2 turns) before finishing."
+        );
+        assert!(incomplete.partial_output.contains("working on it"));
+    }
+
+    #[test]
+    fn classify_outcome_reports_cancellation_as_error() {
+        let mut outcome = base_outcome(conversation_ending_with(
+            Message::assistant().with_text("still going"),
+        ));
+        outcome.cancelled = true;
+
+        let err = classify_outcome(outcome, true).expect_err("must not report success");
+        let incomplete = err
+            .downcast_ref::<SubagentIncomplete>()
+            .expect("error must be a SubagentIncomplete");
+        assert_eq!(
+            incomplete.reason,
+            "Subagent was cancelled before finishing."
+        );
+    }
+
+    #[test]
+    fn classify_outcome_reports_stream_error() {
+        let mut outcome = base_outcome(conversation_ending_with(
+            Message::assistant().with_text("still going"),
+        ));
+        outcome.stream_error = Some(anyhow!("session storage unavailable"));
+
+        let err = classify_outcome(outcome, true).expect_err("must not report success");
+        let incomplete = err
+            .downcast_ref::<SubagentIncomplete>()
+            .expect("error must be a SubagentIncomplete");
+        assert!(incomplete.reason.contains("session storage unavailable"));
+    }
+
+    #[test]
+    fn classify_outcome_final_output_wins_over_incomplete_signals() {
+        let mut outcome = base_outcome(conversation_ending_with(
+            Message::assistant().with_text(MAX_TURNS_MESSAGE),
+        ));
+        outcome.cancelled = true;
+        outcome.final_output = Some("structured result".to_string());
+
+        let result = classify_outcome(outcome, true).expect("final output means completion");
+        assert_eq!(result, "structured result");
+    }
+
+    #[test]
+    fn classify_outcome_normal_completion_is_unchanged() {
+        let outcome = base_outcome(conversation_ending_with(
+            Message::assistant().with_text("all done"),
+        ));
+
+        let result = classify_outcome(outcome, true).expect("normal completion must succeed");
+        assert_eq!(result, "all done");
+    }
+
+    #[test]
+    fn subagent_incomplete_display_includes_reason_and_partial_output() {
+        let incomplete = SubagentIncomplete {
+            reason: "Subagent was cancelled before finishing.".to_string(),
+            partial_output: "partial work".to_string(),
+        };
+        assert_eq!(
+            incomplete.to_string(),
+            "Subagent was cancelled before finishing.\n\npartial work"
+        );
+    }
+
+    #[test]
+    fn subagent_incomplete_display_omits_blank_partial_output() {
+        let incomplete = SubagentIncomplete {
+            reason: "Subagent was cancelled before finishing.".to_string(),
+            partial_output: String::new(),
+        };
+        assert_eq!(
+            incomplete.to_string(),
+            "Subagent was cancelled before finishing."
+        );
+    }
+
+    /// Always responds with text plus a request for a tool that no
+    /// extension advertises, so the agent loop keeps taking turns
+    /// (never reaching a natural "no tool calls" completion) until it
+    /// hits `max_turns`.
+    struct ToolLoopProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for ToolLoopProvider {
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> std::result::Result<MessageStream, ProviderError> {
+            let message = Message::assistant()
+                .with_text("working on it")
+                .with_tool_request(
+                    "loop-call",
+                    Ok(CallToolRequestParams::new("nonexistent__tool")),
+                );
+            let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+            Ok(stream_from_single_message(message, usage))
+        }
+
+        fn get_name(&self) -> &str {
+            "tool-loop"
+        }
+    }
+
+    struct CompletingProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for CompletingProvider {
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _system_prompt: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> std::result::Result<MessageStream, ProviderError> {
+            let message = Message::assistant().with_text("all done");
+            let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
+            Ok(stream_from_single_message(message, usage))
+        }
+
+        fn get_name(&self) -> &str {
+            "completing"
+        }
+    }
+
+    fn empty_recipe(prompt: &str) -> Recipe {
+        Recipe {
+            version: "1.0.0".to_string(),
+            title: String::new(),
+            description: String::new(),
+            instructions: None,
+            prompt: Some(prompt.to_string()),
+            extensions: None,
+            settings: None,
+            activities: None,
+            author: None,
+            parameters: None,
+            response: None,
+            sub_recipes: None,
+            retry: None,
+        }
+    }
+
+    async fn build_test_params(
+        provider: Arc<dyn Provider>,
+        max_turns: usize,
+    ) -> (SubagentRunParams, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let session_manager = Arc::new(SessionManager::new(temp_dir.path().join("data")));
+        let permission_manager = Arc::new(PermissionManager::new(temp_dir.path().join("data")));
+        let mut config = AgentConfig::new(
+            session_manager.clone(),
+            permission_manager,
+            None,
+            GooseMode::Auto,
+            true,
+            GoosePlatform::GooseCli,
+        );
+        config.is_subagent = true;
+
+        let session = session_manager
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "subagent handler test".to_string(),
+                SessionType::SubAgent,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+
+        let task_config = TaskConfig::new(
+            provider,
+            goose_providers::model::ModelConfig::new("mock-model"),
+            "parent-session",
+            temp_dir.path(),
+            vec![],
+        )
+        .with_max_turns(Some(max_turns));
+
+        let params = SubagentRunParams {
+            config,
+            recipe: empty_recipe("keep working"),
+            task_config,
+            return_last_only: true,
+            session_id: session.id,
+            cancellation_token: None,
+            on_message: None,
+            notification_tx: None,
+        };
+        (params, temp_dir)
+    }
+
+    async fn assert_turn_limit_reported_as_error(state_machine: bool) {
+        let _env = env_lock::lock_env([(
+            "GOOSE_STATE_MACHINE",
+            Some(if state_machine { "1" } else { "0" }),
+        )]);
+
+        let (params, _temp_dir) = build_test_params(Arc::new(ToolLoopProvider), 2).await;
+        let result = run_subagent_task(params).await;
+
+        let err = result.expect_err("a subagent that exhausts max_turns must error");
+        let incomplete = err
+            .downcast_ref::<SubagentIncomplete>()
+            .unwrap_or_else(|| panic!("expected SubagentIncomplete, got: {err}"));
+        assert!(
+            incomplete.reason.contains("turn limit (2 turns)"),
+            "unexpected reason: {}",
+            incomplete.reason
+        );
+        assert!(
+            incomplete.partial_output.contains("working on it"),
+            "partial output should retain the subagent's prior text: {}",
+            incomplete.partial_output
+        );
+    }
+
+    #[tokio::test]
+    async fn run_subagent_task_reports_turn_limit_as_error_legacy_loop() {
+        assert_turn_limit_reported_as_error(false).await;
+    }
+
+    #[tokio::test]
+    async fn run_subagent_task_reports_turn_limit_as_error_state_machine_loop() {
+        assert_turn_limit_reported_as_error(true).await;
+    }
+
+    #[tokio::test]
+    async fn run_subagent_task_normal_completion_still_succeeds() {
+        let (params, _temp_dir) = build_test_params(Arc::new(CompletingProvider), 25).await;
+        let result = run_subagent_task(params).await;
+        assert_eq!(result.unwrap(), "all done");
     }
 }
