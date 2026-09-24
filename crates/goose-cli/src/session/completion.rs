@@ -247,6 +247,7 @@ impl GooseCompleter {
             "/model".to_string(),
             "/new".to_string(),
             "/resume".to_string(),
+            "/tools".to_string(),
         ];
 
         let cache = self.completion_cache.read().unwrap();

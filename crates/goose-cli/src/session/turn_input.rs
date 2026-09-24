@@ -16,12 +16,36 @@ use crossterm::event::{
 };
 use crossterm::terminal;
 use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(40);
 const PROMPT: &str = "> ";
+
+/// Set by Ctrl+O on the turn-input reader thread; the main render loop polls
+/// and clears it between agent events, since the reader has no access to the
+/// session's tool activity log to print from directly.
+static SHOW_LAST_BLOCK_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Takes and clears the pending Ctrl+O request, if any.
+pub(super) fn take_show_last_block_request() -> bool {
+    SHOW_LAST_BLOCK_REQUESTED.swap(false, Ordering::Relaxed)
+}
+
+/// Whether the turn-input prompt currently occupies the terminal's last
+/// line — the same condition `start`/`read_loop` already act on to hide the
+/// thinking spinner before it would be drawn over a half-typed/queued line.
+/// Exposed so any caller that might show the spinner (not just this module)
+/// can skip it while true, instead of each one reimplementing the check.
+pub(super) fn prompt_owns_the_line() -> bool {
+    prompt_drawn(&shared().state.lock().unwrap())
+}
+
+fn prompt_drawn(state: &State) -> bool {
+    state.running && state.prompt_shown
+}
 
 /// What the user typed while the turn was running.
 pub(super) struct Pending {
@@ -308,6 +332,9 @@ fn apply_key(state: &mut State, key: KeyEvent) -> Interrupt {
             state.line.truncate(cut);
             refresh_prompt(state);
         }
+        KeyCode::Char('o') if ctrl => {
+            SHOW_LAST_BLOCK_REQUESTED.store(true, Ordering::Relaxed);
+        }
         // The same key that inserts a line break at the editor prompt.
         KeyCode::Char(c) if ctrl && c == state.newline_key => {
             state.line.push('\n');
@@ -544,6 +571,18 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_o_requests_the_last_block_without_touching_the_line() {
+        let mut state = typed("half typed");
+        take_show_last_block_request(); // drain any request left over from another test
+
+        apply_key(&mut state, ctrl('o'));
+
+        assert_eq!(state.line, "half typed");
+        assert!(take_show_last_block_request());
+        assert!(!take_show_last_block_request());
+    }
+
+    #[test]
     fn typing_records_that_the_prompt_is_in_use() {
         let mut state = State::default();
 
@@ -600,5 +639,22 @@ mod tests {
     #[test]
     fn pasted_newlines_are_shown_on_one_line() {
         assert_eq!(single_line("a\nb\r\nc"), "a b  c");
+    }
+
+    #[test]
+    fn prompt_drawn_requires_running_and_shown() {
+        let mut state = State {
+            running: true,
+            prompt_shown: true,
+            ..State::default()
+        };
+        assert!(prompt_drawn(&state));
+
+        state.prompt_shown = false;
+        assert!(!prompt_drawn(&state), "nothing on screen to collide with");
+
+        state.prompt_shown = true;
+        state.running = false;
+        assert!(!prompt_drawn(&state), "reader isn't even active");
     }
 }
