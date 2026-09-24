@@ -200,6 +200,10 @@ fn merge_subrecipe_parameters(
 struct TaskLoadResult {
     content: Vec<ContentBlock>,
     status: &'static str,
+    /// Whether the task did not reach a usable, completed result (failed,
+    /// panicked, or was cancelled before finishing). A still-running peek
+    /// is not an error: it hasn't finished yet, successfully or otherwise.
+    is_error: bool,
     turns: Option<u32>,
     duration_secs: Option<u64>,
 }
@@ -1036,7 +1040,12 @@ impl SummonClient {
                     serde_json::Value::Number(secs.into()),
                 );
             }
-            return Ok(CallToolResult::success(task_result.content).with_meta(Some(meta)));
+            let result = if task_result.is_error {
+                CallToolResult::error(task_result.content)
+            } else {
+                CallToolResult::success(task_result.content)
+            };
+            return Ok(result.with_meta(Some(meta)));
         }
 
         self.handle_load_source(session_id, name, &working_dir)
@@ -1099,6 +1108,7 @@ impl SummonClient {
                     output
                 ))],
                 status: status_key,
+                is_error: status_key != "completed",
                 turns: Some(turns_taken),
                 duration_secs: Some(duration.as_secs()),
             });
@@ -1144,6 +1154,7 @@ impl SummonClient {
                 return Ok(TaskLoadResult {
                     content: vec![ContentBlock::text(output)],
                     status: "running",
+                    is_error: false,
                     turns: Some(turns_taken),
                     duration_secs: Some(elapsed.as_secs()),
                 });
@@ -1158,17 +1169,17 @@ impl SummonClient {
                 task.cancellation_token.cancel();
 
                 let mut handle = task.handle;
-                let output = tokio::select! {
+                let (output, is_error) = tokio::select! {
                     result = &mut handle => {
                         match result {
-                            Ok(Ok(s)) => s,
-                            Ok(Err(e)) => format!("Error: {}", e),
-                            Err(e) => format!("Task panicked: {}", e),
+                            Ok(Ok(s)) => (s, false),
+                            Ok(Err(e)) => (format!("Error: {}", e), true),
+                            Err(e) => (format!("Task panicked: {}", e), true),
                         }
                     }
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {
                         handle.abort();
-                        "Task did not stop in time (aborted)".to_string()
+                        ("Task did not stop in time (aborted)".to_string(), true)
                     }
                 };
                 let duration = task.started_at.elapsed();
@@ -1188,6 +1199,7 @@ impl SummonClient {
                         output
                     ))],
                     status: "cancelled",
+                    is_error,
                     turns: Some(turns_taken),
                     duration_secs: Some(duration.as_secs()),
                 });
@@ -3898,6 +3910,74 @@ You review code."#;
 
         // All tasks consumed -- moim should be empty
         assert!(client.get_moim("test").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_load_marks_incomplete_background_task_as_tool_error() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+
+        client.completed_tasks.lock().await.insert(
+            "20260204_1".to_string(),
+            CompletedTask {
+                id: "20260204_1".to_string(),
+                description: "Turn-limited task".to_string(),
+                result: Err(
+                    "Subagent stopped after reaching its turn limit (2 turns) before finishing.\n\npartial work"
+                        .to_string(),
+                ),
+                turns_taken: 2,
+                duration: Duration::from_secs(5),
+                completed_at: Instant::now(),
+                notification_sink: buffered_notification_sink(Vec::new()),
+            },
+        );
+
+        let arguments = serde_json::json!({"source": "20260204_1"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let result = client
+            .handle_load("parent", Some(arguments), None)
+            .await
+            .unwrap();
+
+        assert!(result.is_error.unwrap_or(false));
+        let text = extract_text(&result.content[0]);
+        assert!(text.contains("turn limit (2 turns)"));
+        assert!(text.contains("partial work"));
+        assert_eq!(
+            result.meta.unwrap().0.get("task_status"),
+            Some(&serde_json::json!("failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_marks_completed_background_task_as_success() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+
+        client.completed_tasks.lock().await.insert(
+            "20260204_2".to_string(),
+            CompletedTask {
+                id: "20260204_2".to_string(),
+                description: "Finished task".to_string(),
+                result: Ok("all done".to_string()),
+                turns_taken: 3,
+                duration: Duration::from_secs(5),
+                completed_at: Instant::now(),
+                notification_sink: buffered_notification_sink(Vec::new()),
+            },
+        );
+
+        let arguments = serde_json::json!({"source": "20260204_2"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let result = client
+            .handle_load("parent", Some(arguments), None)
+            .await
+            .unwrap();
+
+        assert!(!result.is_error.unwrap_or(false));
     }
 
     #[tokio::test]
