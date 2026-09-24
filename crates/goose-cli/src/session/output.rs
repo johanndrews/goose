@@ -22,6 +22,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
 use std::io::{Error, IsTerminal, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -34,17 +35,51 @@ pub const DEFAULT_CLI_DARK_THEME: &str = "zenburn";
 const OUTPUT_TOKEN_LIMIT_WARNING: &str =
     "Warning: Response reached the model's output-token limit and may be incomplete.";
 
+/// Whether the last thing written through [`emit`]/[`emit_raw`] left the
+/// cursor at column 0. The runtime is multi-threaded, so this is a global
+/// atomic rather than a `thread_local` — the task doing the writing can
+/// migrate between worker threads across `.await` points.
+static AT_LINE_START: AtomicBool = AtomicBool::new(true);
+
+/// The line-start flag after writing `text` raw (no implicit trailing
+/// newline), given whether the cursor was already there. Pure so the edge
+/// cases are testable without a terminal: empty writes change nothing, and
+/// only a trailing newline moves the cursor back to column 0.
+fn cursor_at_line_start_after_raw(text: &str, was_at_line_start: bool) -> bool {
+    if text.is_empty() {
+        was_at_line_start
+    } else {
+        text.ends_with('\n')
+    }
+}
+
 fn emit(line: &str) {
     match super::turn_input::hold_output() {
         Some(mut hold) => hold.write_line(line),
         None => println!("{}", line),
     }
+    AT_LINE_START.store(true, Ordering::Relaxed);
 }
 
 fn emit_raw(text: &str) {
     match super::turn_input::hold_output() {
         Some(mut hold) => hold.write_raw(text),
         None => print!("{}", text),
+    }
+    let was_at_line_start = AT_LINE_START.load(Ordering::Relaxed);
+    AT_LINE_START.store(
+        cursor_at_line_start_after_raw(text, was_at_line_start),
+        Ordering::Relaxed,
+    );
+}
+
+/// Breaks the current line first if the last write left the cursor mid-line
+/// (e.g. streamed assistant text with no trailing newline), so compact tool
+/// lines always start at column 0. A no-op when already at line start, so
+/// consecutive tool lines stay dense.
+fn ensure_line_start() {
+    if !AT_LINE_START.load(Ordering::Relaxed) {
+        emit("");
     }
 }
 
@@ -679,6 +714,7 @@ fn dispatch_tool_request_rendering(
 }
 
 fn emit_compact_request_line(line: &str) {
+    ensure_line_start();
     let width = terminal_width().map(|w| w.saturating_sub(2));
     let truncated = tool_activity::truncate_to_width(line, width);
     emit(&format!("  {}", style(truncated).dim()));
@@ -768,10 +804,14 @@ fn render_tool_response_tracked(resp: &ToolResponse, debug: bool, activity: &mut
     }
     match outcome {
         tool_activity::ResponseOutcome::None => {}
-        tool_activity::ResponseOutcome::Output(line) => emit(&format!("    {}", style(line).dim())),
+        tool_activity::ResponseOutcome::Output(line) => {
+            ensure_line_start();
+            emit(&format!("    {}", style(line).dim()));
+        }
         tool_activity::ResponseOutcome::Error => render_tool_response_legacy(resp, debug),
         tool_activity::ResponseOutcome::Finalized(line) => {
             hide_thinking();
+            ensure_line_start();
             emit(&format!("  {}", style(line).dim()));
         }
     }
@@ -1357,6 +1397,7 @@ fn render_subagent_tool_graph(subagent_id: &str, tool_graph: &[Value]) {
 /// Renders `/tools` (last block) and `/tools <n>`: the full params + stored
 /// output of a tool block, or the nested call log of a subagent block.
 pub fn render_tools_block(activity: &ToolActivity, number: Option<usize>) {
+    ensure_line_start();
     let Some(number) = number.or_else(|| activity.last_block_number()) else {
         emit(&format!("  {}", style("No tool activity yet.").dim()));
         return;
@@ -2214,6 +2255,27 @@ mod tests {
         }
 
         assert_eq!(rendered, "two\n  three\n  four");
+    }
+
+    #[test]
+    fn cursor_stays_mid_line_after_raw_text_without_trailing_newline() {
+        assert!(!cursor_at_line_start_after_raw(
+            "streamed assistant text",
+            true
+        ));
+        assert!(!cursor_at_line_start_after_raw("still mid-line", false));
+    }
+
+    #[test]
+    fn cursor_returns_to_line_start_after_raw_text_ending_in_newline() {
+        assert!(cursor_at_line_start_after_raw("done.\n", false));
+        assert!(cursor_at_line_start_after_raw("already there\n", true));
+    }
+
+    #[test]
+    fn empty_raw_write_leaves_the_cursor_position_unchanged() {
+        assert!(cursor_at_line_start_after_raw("", true));
+        assert!(!cursor_at_line_start_after_raw("", false));
     }
 
     #[test]
