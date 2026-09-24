@@ -33,6 +33,7 @@ pub enum InputResult {
     ListSkills,
     LoadSkills(Vec<String>),
     ListExtensions,
+    ShowTools(Option<usize>),
 }
 
 #[derive(Debug)]
@@ -55,6 +56,32 @@ struct CtrlCHandler {
 impl CtrlCHandler {
     fn new(completion_cache: Arc<std::sync::RwLock<CompletionCache>>) -> Self {
         Self { completion_cache }
+    }
+}
+
+/// Ctrl+O at the prompt submits `/tools` immediately, discarding whatever was
+/// half-typed — the same trade-off Ctrl+C already makes for the empty-line case.
+struct ShowToolsHandler {
+    requested: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ShowToolsHandler {
+    fn new(requested: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { requested }
+    }
+}
+
+impl rustyline::ConditionalEventHandler for ShowToolsHandler {
+    fn handle(
+        &self,
+        _event: &rustyline::Event,
+        _n: u16,
+        _positive: bool,
+        _ctx: &rustyline::EventContext,
+    ) -> Option<rustyline::Cmd> {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Some(rustyline::Cmd::AcceptLine)
     }
 }
 
@@ -186,6 +213,14 @@ pub fn get_input(
         rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache))),
     );
 
+    let show_tools_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    editor.bind_sequence(
+        rustyline::KeyEvent(rustyline::KeyCode::Char('o'), rustyline::Modifiers::CTRL),
+        rustyline::EventHandler::Conditional(Box::new(ShowToolsHandler::new(
+            show_tools_requested.clone(),
+        ))),
+    );
+
     let input = match read_paste_aware_input(editor, paste_state, unsent) {
         Ok(text) => text,
         Err(e) => match e {
@@ -194,6 +229,10 @@ pub fn get_input(
             _ => return Err(e.into()),
         },
     };
+
+    if show_tools_requested.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(InputResult::ShowTools(None));
+    }
 
     // Add valid input to history (history saving to file is handled in the Session::interactive method)
     if !input.trim().is_empty() {
@@ -242,6 +281,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_EDIT_WITH_SPACE: &str = "/edit ";
     const CMD_SKILLS: &str = "/skills";
     const CMD_EXTENSIONS: &str = "/extensions";
+    const CMD_TOOLS: &str = "/tools";
 
     match input {
         "/exit" | "/quit" => Some(InputResult::Exit),
@@ -355,6 +395,20 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
             Some(InputResult::Compact)
         }
         "/r" => Some(InputResult::ToggleFullToolOutput),
+        s if s == CMD_TOOLS => Some(InputResult::ShowTools(None)),
+        s if s.starts_with(&format!("{CMD_TOOLS} ")) => {
+            let arg = s.get(CMD_TOOLS.len()..).unwrap_or("").trim();
+            match arg.parse::<usize>() {
+                Ok(n) => Some(InputResult::ShowTools(Some(n))),
+                Err(_) => {
+                    println!(
+                        "{}",
+                        console::style(format!("Usage: {CMD_TOOLS} [<n>]")).yellow()
+                    );
+                    Some(InputResult::Retry)
+                }
+            }
+        }
         s if s == CMD_EDIT => Some(InputResult::Edit(None)),
         s if s.starts_with(CMD_EDIT_WITH_SPACE) => {
             let prefill = s
@@ -465,6 +519,7 @@ fn help_text() -> String {
 /t - Toggle Light/Dark/Ansi theme
 /t <name> - Set theme directly (light, dark, ansi)
 /r - Toggle full tool output display (show complete tool parameters without truncation)
+/tools [<n>] - Show the full detail of the last (or numbered) tool call/subagent block
 /extension <command> - Add a stdio extension (format: ENV1=val1 command args...)
 /builtin <names> - Add builtin extensions by name (comma-separated)
 /prompts [--extension <name>] - List all available prompts, optionally filtered by extension
@@ -488,6 +543,7 @@ Navigation:
 Enter - Send message
 Ctrl+{newline_key} - Add a newline (configurable via GOOSE_CLI_NEWLINE_KEY)
 Ctrl+C - Clear current line if text is entered, otherwise exit the session
+Ctrl+O - Show the full detail of the last tool call/subagent block (same as /tools)
 Up/Down arrows - Navigate through command history
 GOOSE_CLI_BELL=true - Ring the terminal bell when goose finishes a turn or needs approval"
     )
@@ -618,6 +674,20 @@ mod tests {
         assert!(matches!(
             handle_slash_command("/r"),
             Some(InputResult::ToggleFullToolOutput)
+        ));
+
+        // Test tools command
+        assert!(matches!(
+            handle_slash_command("/tools"),
+            Some(InputResult::ShowTools(None))
+        ));
+        assert!(matches!(
+            handle_slash_command("/tools 7"),
+            Some(InputResult::ShowTools(Some(7)))
+        ));
+        assert!(matches!(
+            handle_slash_command("/tools not-a-number"),
+            Some(InputResult::Retry)
         ));
 
         // Test extension command

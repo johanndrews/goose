@@ -16,12 +16,23 @@ use crossterm::event::{
 };
 use crossterm::terminal;
 use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(40);
 const PROMPT: &str = "> ";
+
+/// Set by Ctrl+O on the turn-input reader thread; the main render loop polls
+/// and clears it between agent events, since the reader has no access to the
+/// session's tool activity log to print from directly.
+static SHOW_LAST_BLOCK_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Takes and clears the pending Ctrl+O request, if any.
+pub(super) fn take_show_last_block_request() -> bool {
+    SHOW_LAST_BLOCK_REQUESTED.swap(false, Ordering::Relaxed)
+}
 
 /// What the user typed while the turn was running.
 pub(super) struct Pending {
@@ -308,6 +319,9 @@ fn apply_key(state: &mut State, key: KeyEvent) -> Interrupt {
             state.line.truncate(cut);
             refresh_prompt(state);
         }
+        KeyCode::Char('o') if ctrl => {
+            SHOW_LAST_BLOCK_REQUESTED.store(true, Ordering::Relaxed);
+        }
         // The same key that inserts a line break at the editor prompt.
         KeyCode::Char(c) if ctrl && c == state.newline_key => {
             state.line.push('\n');
@@ -541,6 +555,18 @@ mod tests {
         apply_key(&mut state, ctrl('w'));
 
         assert_eq!(state.line, "cargo ");
+    }
+
+    #[test]
+    fn ctrl_o_requests_the_last_block_without_touching_the_line() {
+        let mut state = typed("half typed");
+        take_show_last_block_request(); // drain any request left over from another test
+
+        apply_key(&mut state, ctrl('o'));
+
+        assert_eq!(state.line, "half typed");
+        assert!(take_show_last_block_request());
+        assert!(!take_show_last_block_request());
     }
 
     #[test]

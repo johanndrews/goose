@@ -7,6 +7,7 @@ mod output;
 mod paste;
 pub mod streaming_buffer;
 mod thinking;
+mod tool_activity;
 mod turn_input;
 
 use goose::conversation::Conversation;
@@ -250,6 +251,7 @@ pub struct CliSession {
     /// gate.
     extension_loading: Option<AbortOnDropHandle<Result<Vec<ExtensionFailure>>>>,
     loading_announced: bool,
+    tool_activity: tool_activity::ToolActivity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,11 +342,23 @@ impl CliSession {
             unsent_input: String::new(),
             extension_loading,
             loading_announced: false,
+            tool_activity: tool_activity::ToolActivity::new(),
         }
     }
 
     pub fn session_id(&self) -> &String {
         &self.session_id
+    }
+
+    /// Whether tool activity should be recorded into `self.tool_activity` at
+    /// all (numbering, `/tools`, the compact display). `goose run` headless,
+    /// `--json`/`--stream-json` output, and non-terminal stdout stay exactly
+    /// as they were before this display existed.
+    fn tool_tracking_active(&self, interactive: bool) -> bool {
+        interactive
+            && self.output_format != "json"
+            && self.output_format != "stream-json"
+            && std::io::stdout().is_terminal()
     }
 
     /// Parse a stdio extension command string into an ExtensionConfig
@@ -794,6 +808,10 @@ impl CliSession {
                 history.save(editor);
                 self.handle_list_extensions().await?;
             }
+            InputResult::ShowTools(number) => {
+                history.save(editor);
+                output::render_tools_block(&self.tool_activity, number);
+            }
         }
         Ok(())
     }
@@ -1123,6 +1141,7 @@ impl CliSession {
         output::render_message(
             &Message::assistant().with_text("Chat context cleared.\n"),
             self.debug,
+            None,
         );
         Ok(())
     }
@@ -1241,6 +1260,7 @@ impl CliSession {
 
         self.session_id = new_session_id;
         self.messages = new_messages;
+        self.tool_activity.reset();
         self.agent.set_goal(None).await;
         self.agent.set_grind(None).await;
 
@@ -1293,7 +1313,7 @@ impl CliSession {
                 unavailable.join(", ")
             ));
         }
-        output::render_message(&Message::assistant().with_text(started), self.debug);
+        output::render_message(&Message::assistant().with_text(started), self.debug, None);
 
         // The conversation is in memory either way, but only the terminal makes it
         // usable for the person at it, so a resumed session replays like `--resume`.
@@ -1467,6 +1487,7 @@ impl CliSession {
     ) -> Result<()> {
         let is_json_mode = self.output_format == "json";
         let is_stream_json_mode = self.output_format == "stream-json";
+        let tracking = self.tool_tracking_active(interactive);
 
         let session_config = SessionConfig {
             id: self.session_id.clone(),
@@ -1508,6 +1529,9 @@ impl CliSession {
 
         use futures::StreamExt;
         loop {
+            if tracking && turn_input::take_show_last_block_request() {
+                output::render_tools_block(&self.tool_activity, None);
+            }
             tokio::select! {
                 result = stream.next() => {
                     match result {
@@ -1639,7 +1663,8 @@ impl CliSession {
                                 if is_stream_json_mode {
                                     emit_stream_event(&StreamEvent::Message { message: message.clone() });
                                 } else if !is_json_mode {
-                                    output::render_message_streaming(&message, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                                    let activity = tracking.then_some(&mut self.tool_activity);
+                                    output::render_message_streaming(&message, &mut markdown_buffer, &mut thinking_header_shown, self.debug, activity);
                                     maybe_open_credits_top_up_url(
                                         &message,
                                         interactive,
@@ -1653,14 +1678,18 @@ impl CliSession {
                         }
                         Some(Ok(AgentEvent::MessageUsage { .. })) => {}
                         Some(Ok(AgentEvent::McpNotification((extension_id, notification)))) => {
+                            let activity = tracking.then_some(&mut self.tool_activity);
                             handle_mcp_notification(
                                 &extension_id,
                                 &notification,
                                 &mut progress_bars,
-                                is_stream_json_mode,
-                                interactive,
-                                is_json_mode,
-                                self.debug,
+                                NotificationFlags {
+                                    is_stream_json_mode,
+                                    interactive,
+                                    is_json_mode,
+                                    debug: self.debug,
+                                },
+                                activity,
                             );
                         }
                         Some(Ok(AgentEvent::HistoryReplaced(updated_conversation))) => {
@@ -1855,6 +1884,7 @@ impl CliSession {
             output::render_message(
                 &Message::assistant().with_text(interrupt_prompt),
                 self.debug,
+                None,
             );
         } else {
             while self.messages.last().is_some_and(Message::is_turn_context) {
@@ -1868,13 +1898,14 @@ impl CliSession {
                             output::render_message(
                                 &Message::assistant().with_text(interrupt_prompt),
                                 self.debug,
+                                None,
                             );
                         }
                         Some(_) => {
                             self.messages.pop();
                             let assistant_msg = Message::assistant().with_text(interrupt_prompt);
                             self.push_message(assistant_msg.clone());
-                            output::render_message(&assistant_msg, self.debug);
+                            output::render_message(&assistant_msg, self.debug, None);
                         }
                         None => {
                             // Empty message content — nothing to do, just continue gracefully
@@ -2032,7 +2063,7 @@ impl CliSession {
     }
 
     /// Render all past messages from the session history
-    pub fn render_message_history(&self) {
+    pub fn render_message_history(&mut self) {
         let messages = self.messages.user_visible_messages();
         if messages.is_empty() {
             return;
@@ -2044,9 +2075,11 @@ impl CliSession {
             console::style(format!("{} messages restored", messages.len())).dim()
         );
 
+        let tracking = self.tool_tracking_active(true);
         // Render each message
         for message in &messages {
-            output::render_message(message, self.debug);
+            let activity = tracking.then_some(&mut self.tool_activity);
+            output::render_message(message, self.debug, activity);
         }
 
         println!();
@@ -2151,7 +2184,7 @@ impl CliSession {
                         }
 
                         if msg.role == rmcp::model::Role::User {
-                            output::render_message(&msg, self.debug);
+                            output::render_message(&msg, self.debug, None);
                         }
                         self.push_message(msg);
                     }
@@ -2519,17 +2552,30 @@ fn find_elicitation_request(message: &Message) -> Option<(String, String, Value)
     })
 }
 
+/// Flags that decide how a notification is rendered, bundled since they
+/// travel together through every branch of [`handle_mcp_notification`].
+struct NotificationFlags {
+    is_stream_json_mode: bool,
+    interactive: bool,
+    is_json_mode: bool,
+    debug: bool,
+}
+
 /// Handle MCP notification event (logging or progress)
 #[expect(deprecated)]
 fn handle_mcp_notification(
     extension_id: &str,
     notification: &ServerNotification,
     progress_bars: &mut output::McpSpinners,
-    is_stream_json_mode: bool,
-    interactive: bool,
-    is_json_mode: bool,
-    debug: bool,
+    flags: NotificationFlags,
+    activity: Option<&mut tool_activity::ToolActivity>,
 ) {
+    let NotificationFlags {
+        is_stream_json_mode,
+        interactive,
+        is_json_mode,
+        debug,
+    } = flags;
     match notification {
         ServerNotification::LoggingMessageNotification(log_notif) => {
             if let Some(obj) = log_notif.params.data.as_object() {
@@ -2564,10 +2610,13 @@ fn handle_mcp_notification(
                         }
                         if !is_json_mode {
                             output::render_subagent_tool_call(
-                                subagent_id,
-                                tool_name,
-                                arguments.as_ref(),
+                                output::SubagentToolCall {
+                                    subagent_id,
+                                    tool_name,
+                                    arguments: arguments.as_ref(),
+                                },
                                 debug,
+                                activity,
                             );
                             return;
                         }

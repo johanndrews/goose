@@ -1,6 +1,7 @@
 use crate::session::builder::ExtensionFailure;
 use anstream::{adapter::strip_str, eprintln, println};
 use bat::WrappingMode;
+use chrono::{DateTime, Local};
 use console::{measure_text_width, style, Color, StyledObject, Term};
 use goose::agents::platform_extensions::todo::TODO_WRITE_TOOL_NAME_COMPLETE;
 use goose::config::Config;
@@ -14,7 +15,7 @@ use goose::subprocess::SubprocessExt;
 use goose::utils::safe_truncate;
 use goose_providers::conversation::token_usage::Usage;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use rmcp::model::{CallToolRequestParams, JsonObject, PromptArgument, Role};
+use rmcp::model::{CallToolRequestParams, ContentBlock, JsonObject, PromptArgument, Role};
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -25,6 +26,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use super::streaming_buffer::MarkdownBuffer;
+use super::tool_activity::{self, ToolActivity};
 
 pub const DEFAULT_MIN_PRIORITY: f32 = 0.0;
 pub const DEFAULT_CLI_LIGHT_THEME: &str = "GitHub";
@@ -327,7 +329,7 @@ pub fn set_thinking_message(s: &String) {
     }
 }
 
-pub fn render_message(message: &Message, debug: bool) {
+pub fn render_message(message: &Message, debug: bool, mut activity: Option<&mut ToolActivity>) {
     if !message.is_user_visible() {
         return;
     }
@@ -352,8 +354,12 @@ pub fn render_message(message: &Message, debug: bool) {
                 }
             },
             MessageContent::Text(text) => print_markdown(&text.text, theme),
-            MessageContent::ToolRequest(req) => render_tool_request(req, theme, debug),
-            MessageContent::ToolResponse(resp) => render_tool_response(resp, debug),
+            MessageContent::ToolRequest(req) => {
+                render_tool_request(req, theme, debug, activity.as_deref_mut())
+            }
+            MessageContent::ToolResponse(resp) => {
+                render_tool_response(resp, debug, activity.as_deref_mut())
+            }
             MessageContent::Image(image) => {
                 emit(&format!(
                     "Image: [data: {}, type: {}]",
@@ -404,6 +410,7 @@ pub fn render_message_streaming(
     buffer: &mut MarkdownBuffer,
     thinking_header_shown: &mut bool,
     debug: bool,
+    mut activity: Option<&mut ToolActivity>,
 ) {
     if !message.is_user_visible() {
         return;
@@ -427,11 +434,11 @@ pub fn render_message_streaming(
             }
             MessageContent::ToolRequest(req) => {
                 flush_markdown_buffer(buffer, theme);
-                render_tool_request(req, theme, debug);
+                render_tool_request(req, theme, debug, activity.as_deref_mut());
             }
             MessageContent::ToolResponse(resp) => {
                 flush_markdown_buffer(buffer, theme);
-                render_tool_response(resp, debug);
+                render_tool_response(resp, debug, activity.as_deref_mut());
             }
             MessageContent::ActionRequired(action) => {
                 flush_markdown_buffer(buffer, theme);
@@ -611,54 +618,116 @@ fn render_thinking_streaming(
     }
 }
 
-fn render_tool_request(req: &ToolRequest, theme: Theme, debug: bool) {
-    match &req.tool_call {
-        Ok(call) => match call.name.to_string().as_str() {
-            name if is_shell_tool_name(name) => render_shell_request(call, debug),
-            name if is_file_tool_name(name) => render_text_editor_request(call, debug),
-            "execute_typescript" | "execute_code" => render_execute_code_request(call, debug),
-            "delegate" => render_delegate_request(call, debug),
-            "subagent" => render_delegate_request(call, debug),
-            TODO_WRITE_TOOL_NAME_COMPLETE => render_todo_request(call, debug),
-            "load" => {}
-            _ => render_default_request(call, debug),
-        },
-        Err(e) => print_markdown(&e.to_string(), theme),
+/// Whether tool activity should render as the old, uncapped detail view
+/// (header + full params + up to 20/all output lines) instead of the
+/// compact one-liner. `/r` and `--debug` opt back into it live; the config
+/// key picks the default a session starts with.
+fn full_display_active(debug: bool) -> bool {
+    debug || get_show_full_tool_output() || tool_display_is_full_by_config()
+}
+
+fn tool_display_is_full_by_config() -> bool {
+    Config::global()
+        .get_param::<String>("GOOSE_CLI_TOOL_DISPLAY")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("full"))
+}
+
+fn render_tool_request(
+    req: &ToolRequest,
+    theme: Theme,
+    debug: bool,
+    activity: Option<&mut ToolActivity>,
+) {
+    let call = match &req.tool_call {
+        Ok(call) => call,
+        Err(e) => return print_markdown(&e.to_string(), theme),
+    };
+
+    let Some(activity) = activity else {
+        return dispatch_tool_request_rendering(call, debug, None);
+    };
+
+    let name = call.name.to_string();
+    let Some(recorded) = activity.record_request(&req.id, &name, call.arguments.as_ref()) else {
+        return;
+    };
+
+    if full_display_active(debug) {
+        dispatch_tool_request_rendering(call, debug, Some((recorded.number, recorded.time)));
+    } else {
+        emit_compact_request_line(&recorded.line);
     }
 }
 
-fn render_tool_response(resp: &ToolResponse, debug: bool) {
-    let config = Config::global();
+fn dispatch_tool_request_rendering(
+    call: &CallToolRequestParams,
+    debug: bool,
+    numbering: Option<(usize, DateTime<Local>)>,
+) {
+    match call.name.to_string().as_str() {
+        name if is_shell_tool_name(name) => render_shell_request(call, debug, numbering),
+        name if is_file_tool_name(name) => render_text_editor_request(call, debug, numbering),
+        "execute_typescript" | "execute_code" => {
+            render_execute_code_request(call, debug, numbering)
+        }
+        "delegate" | "subagent" => render_delegate_request(call, debug, numbering),
+        TODO_WRITE_TOOL_NAME_COMPLETE => render_todo_request(call, debug, numbering),
+        "load" => {}
+        _ => render_default_request(call, debug, numbering),
+    }
+}
 
+fn emit_compact_request_line(line: &str) {
+    let width = terminal_width().map(|w| w.saturating_sub(2));
+    let truncated = tool_activity::truncate_to_width(line, width);
+    emit(&format!("  {}", style(truncated).dim()));
+}
+
+fn min_priority_config() -> f32 {
+    Config::global()
+        .get_param::<f32>("GOOSE_CLI_MIN_PRIORITY")
+        .ok()
+        .unwrap_or(DEFAULT_MIN_PRIORITY)
+}
+
+fn content_annotations(content: &ContentBlock) -> Option<&rmcp::model::Annotations> {
+    match content {
+        ContentBlock::Text(t) => t.annotations.as_ref(),
+        ContentBlock::Image(i) => i.annotations.as_ref(),
+        ContentBlock::Audio(a) => a.annotations.as_ref(),
+        ContentBlock::Resource(r) => r.annotations.as_ref(),
+        ContentBlock::ResourceLink(r) => r.annotations.as_ref(),
+        _ => None,
+    }
+}
+
+fn content_passes_filter(content: &ContentBlock, min_priority: f32, debug: bool) -> bool {
+    let annotations = content_annotations(content);
+    if let Some(audience) = annotations.and_then(|a| a.audience.as_ref()) {
+        if !audience.contains(&Role::User) {
+            return false;
+        }
+    }
+    let priority = annotations.and_then(|a| a.priority);
+    !(priority.is_some_and(|priority| priority < min_priority) || (priority.is_none() && !debug))
+}
+
+fn render_tool_response(resp: &ToolResponse, debug: bool, activity: Option<&mut ToolActivity>) {
+    match activity {
+        None => render_tool_response_legacy(resp, debug),
+        Some(activity) => render_tool_response_tracked(resp, debug, activity),
+    }
+}
+
+fn render_tool_response_legacy(resp: &ToolResponse, debug: bool) {
     match &resp.tool_result {
         Ok(result) => {
+            let min_priority = min_priority_config();
             for content in &result.content {
-                let annotations = match content {
-                    rmcp::model::ContentBlock::Text(t) => t.annotations.as_ref(),
-                    rmcp::model::ContentBlock::Image(i) => i.annotations.as_ref(),
-                    rmcp::model::ContentBlock::Audio(a) => a.annotations.as_ref(),
-                    rmcp::model::ContentBlock::Resource(r) => r.annotations.as_ref(),
-                    rmcp::model::ContentBlock::ResourceLink(r) => r.annotations.as_ref(),
-                    _ => None,
-                };
-                if let Some(audience) = annotations.and_then(|a| a.audience.as_ref()) {
-                    if !audience.contains(&rmcp::model::Role::User) {
-                        continue;
-                    }
-                }
-
-                let min_priority = config
-                    .get_param::<f32>("GOOSE_CLI_MIN_PRIORITY")
-                    .ok()
-                    .unwrap_or(DEFAULT_MIN_PRIORITY);
-
-                let priority = annotations.and_then(|a| a.priority);
-                if priority.is_some_and(|priority| priority < min_priority)
-                    || (priority.is_none() && !debug)
-                {
+                if !content_passes_filter(content, min_priority, debug) {
                     continue;
                 }
-
                 if debug {
                     emit(&format!("{:#?}", content));
                 } else if let Some(text) = content.as_text() {
@@ -668,6 +737,42 @@ fn render_tool_response(resp: &ToolResponse, debug: bool) {
         }
         Err(e) => {
             emit(&format!("    {}", style(e.to_string()).red().dim()));
+        }
+    }
+}
+
+fn filtered_response_text(result: &rmcp::model::CallToolResult, debug: bool) -> String {
+    let min_priority = min_priority_config();
+    result
+        .content
+        .iter()
+        .filter(|content| content_passes_filter(content, min_priority, debug))
+        .filter_map(|content| content.as_text().map(|t| t.text.clone()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_tool_response_tracked(resp: &ToolResponse, debug: bool, activity: &mut ToolActivity) {
+    let (text, is_error, meta) = match &resp.tool_result {
+        Ok(result) => (
+            filtered_response_text(result, debug),
+            result.is_error.unwrap_or(false),
+            result.meta.as_deref(),
+        ),
+        Err(e) => (e.to_string(), true, None),
+    };
+    let outcome = activity.record_response(&resp.id, &text, is_error, meta);
+
+    if full_display_active(debug) {
+        return render_tool_response_legacy(resp, debug);
+    }
+    match outcome {
+        tool_activity::ResponseOutcome::None => {}
+        tool_activity::ResponseOutcome::Output(line) => emit(&format!("    {}", style(line).dim())),
+        tool_activity::ResponseOutcome::Error => render_tool_response_legacy(resp, debug),
+        tool_activity::ResponseOutcome::Finalized(line) => {
+            hide_thinking();
+            emit(&format!("  {}", style(line).dim()));
         }
     }
 }
@@ -900,8 +1005,12 @@ pub fn render_builtin_error(names: &str, error: &str) {
     emit("");
 }
 
-fn render_text_editor_request(call: &CallToolRequestParams, debug: bool) {
-    print_tool_header(call);
+fn render_text_editor_request(
+    call: &CallToolRequestParams,
+    debug: bool,
+    numbering: Option<(usize, DateTime<Local>)>,
+) {
+    print_tool_header(call, numbering);
 
     if let Some(args) = &call.arguments {
         if let Some(Value::String(path)) = args.get("path") {
@@ -927,13 +1036,21 @@ fn render_text_editor_request(call: &CallToolRequestParams, debug: bool) {
     emit("");
 }
 
-fn render_shell_request(call: &CallToolRequestParams, debug: bool) {
-    print_tool_header(call);
+fn render_shell_request(
+    call: &CallToolRequestParams,
+    debug: bool,
+    numbering: Option<(usize, DateTime<Local>)>,
+) {
+    print_tool_header(call, numbering);
     print_params(&call.arguments, 1, debug);
     emit("");
 }
 
-fn render_execute_code_request(call: &CallToolRequestParams, debug: bool) {
+fn render_execute_code_request(
+    call: &CallToolRequestParams,
+    debug: bool,
+    numbering: Option<(usize, DateTime<Local>)>,
+) {
     let tool_graph = call
         .arguments
         .as_ref()
@@ -942,15 +1059,16 @@ fn render_execute_code_request(call: &CallToolRequestParams, debug: bool) {
         .filter(|arr| !arr.is_empty());
 
     let Some(tool_graph) = tool_graph else {
-        return render_default_request(call, debug);
+        return render_default_request(call, debug, numbering);
     };
 
     let count = tool_graph.len();
     let plural = if count == 1 { "" } else { "s" };
     emit("");
     emit(&format!(
-        "  {} {} {} tool call{}",
+        "  {} {}{} {} tool call{}",
         style("▸").dim(),
+        numbering_prefix(numbering),
         style("execute").dim(),
         style(count).dim(),
         plural,
@@ -1000,8 +1118,12 @@ fn render_execute_code_request(call: &CallToolRequestParams, debug: bool) {
     emit("");
 }
 
-fn render_delegate_request(call: &CallToolRequestParams, debug: bool) {
-    print_tool_header(call);
+fn render_delegate_request(
+    call: &CallToolRequestParams,
+    debug: bool,
+    numbering: Option<(usize, DateTime<Local>)>,
+) {
+    print_tool_header(call, numbering);
 
     if let Some(args) = &call.arguments {
         if let Some(Value::String(source)) = args.get("source") {
@@ -1045,54 +1167,7 @@ fn render_delegate_request(call: &CallToolRequestParams, debug: bool) {
     emit("");
 }
 
-struct TodoSummary {
-    open: usize,
-    done: usize,
-    next_open: Vec<String>,
-}
-
-fn checkbox_item(trimmed: &str) -> Option<(bool, &str)> {
-    let rest = trimmed.strip_prefix("- [")?;
-    let mut chars = rest.chars();
-    let mark = chars.next()?;
-    if chars.next()? != ']' {
-        return None;
-    }
-    let done = match mark {
-        ' ' => false,
-        'x' | 'X' => true,
-        _ => return None,
-    };
-    Some((done, chars.as_str().trim_start()))
-}
-
-fn summarize_todos(content: &str) -> Option<TodoSummary> {
-    let mut summary = TodoSummary {
-        open: 0,
-        done: 0,
-        next_open: Vec::new(),
-    };
-
-    for line in content.lines() {
-        let Some((done, text)) = checkbox_item(line.trim_start()) else {
-            continue;
-        };
-        if done {
-            summary.done += 1;
-        } else {
-            summary.open += 1;
-            if summary.next_open.len() < 3 {
-                summary.next_open.push(text.to_string());
-            }
-        }
-    }
-
-    if summary.open == 0 && summary.done == 0 {
-        None
-    } else {
-        Some(summary)
-    }
-}
+use tool_activity::{summarize_todos, TodoSummary};
 
 fn print_todo_summary(summary: &TodoSummary) {
     emit(&format!(
@@ -1118,8 +1193,12 @@ fn print_todo_summary(summary: &TodoSummary) {
     }
 }
 
-fn render_todo_request(call: &CallToolRequestParams, debug: bool) {
-    print_tool_header(call);
+fn render_todo_request(
+    call: &CallToolRequestParams,
+    debug: bool,
+    numbering: Option<(usize, DateTime<Local>)>,
+) {
+    print_tool_header(call, numbering);
 
     if let Some(args) = &call.arguments {
         if let Some(Value::String(content)) = args.get("content") {
@@ -1137,8 +1216,12 @@ fn render_todo_request(call: &CallToolRequestParams, debug: bool) {
     emit("");
 }
 
-fn render_default_request(call: &CallToolRequestParams, debug: bool) {
-    print_tool_header(call);
+fn render_default_request(
+    call: &CallToolRequestParams,
+    debug: bool,
+    numbering: Option<(usize, DateTime<Local>)>,
+) {
+    print_tool_header(call, numbering);
     print_params(&call.arguments, 1, debug);
     emit("");
 }
@@ -1165,29 +1248,57 @@ pub fn format_subagent_tool_call_message(subagent_id: &str, tool_name: &str) -> 
     }
 }
 
+/// A subagent tool-call notification: the `SUBAGENT_TOOL_REQUEST_TYPE` MCP
+/// notification's payload, parsed by the caller.
+pub struct SubagentToolCall<'a> {
+    pub subagent_id: &'a str,
+    pub tool_name: &'a str,
+    pub arguments: Option<&'a JsonObject>,
+}
+
 pub fn render_subagent_tool_call(
-    subagent_id: &str,
-    tool_name: &str,
-    arguments: Option<&JsonObject>,
+    call: SubagentToolCall,
     debug: bool,
+    activity: Option<&mut ToolActivity>,
 ) {
-    if tool_name == "code_execution__execute_typescript" {
-        let tool_graph = arguments
+    let Some(activity) = activity else {
+        return render_subagent_tool_call_legacy(call, debug);
+    };
+    if full_display_active(debug) {
+        return render_subagent_tool_call_legacy(call, debug);
+    }
+
+    let spinner_text =
+        activity.record_subagent_call(call.subagent_id, call.tool_name, call.arguments);
+    if !is_showing_thinking() {
+        show_thinking();
+    }
+    set_thinking_message(&spinner_text);
+}
+
+fn render_subagent_tool_call_legacy(call: SubagentToolCall, debug: bool) {
+    if call.tool_name == "code_execution__execute_typescript" {
+        let tool_graph = call
+            .arguments
             .and_then(|args| args.get("tool_graph"))
             .and_then(Value::as_array)
             .filter(|arr| !arr.is_empty());
         if let Some(tool_graph) = tool_graph {
-            return render_subagent_tool_graph(subagent_id, tool_graph);
+            return render_subagent_tool_graph(call.subagent_id, tool_graph);
         }
     }
     let tool_header = format!(
         "  {} {}",
         style("▸").dim(),
-        style(format_subagent_tool_call_message(subagent_id, tool_name)).dim(),
+        style(format_subagent_tool_call_message(
+            call.subagent_id,
+            call.tool_name
+        ))
+        .dim(),
     );
     emit("");
     emit(&tool_header);
-    print_params(&arguments.cloned(), 1, debug);
+    print_params(&call.arguments.cloned(), 1, debug);
     emit("");
 }
 
@@ -1238,20 +1349,98 @@ fn render_subagent_tool_graph(subagent_id: &str, tool_graph: &[Value]) {
     emit("");
 }
 
+/// Renders `/tools` (last block) and `/tools <n>`: the full params + stored
+/// output of a tool block, or the nested call log of a subagent block.
+pub fn render_tools_block(activity: &ToolActivity, number: Option<usize>) {
+    let Some(number) = number.or_else(|| activity.last_block_number()) else {
+        emit(&format!("  {}", style("No tool activity yet.").dim()));
+        return;
+    };
+    let Some(description) = activity.describe(number) else {
+        render_error(&format!("No tool call #{number} in this session."));
+        return;
+    };
+
+    match description {
+        tool_activity::Description::Tool {
+            tool_name,
+            params,
+            output,
+            output_is_error,
+        } => {
+            emit(&format!(
+                "  {} #{} {}",
+                style("▸").dim(),
+                number,
+                style(tool_name).dim()
+            ));
+            print_params(&params.cloned(), 1, true);
+            if let Some(output) = output {
+                let label = if output_is_error {
+                    "⎿ error"
+                } else {
+                    "⎿ output"
+                };
+                emit(&format!("  {}", style(label).dim()));
+                for line in output.lines() {
+                    print_tool_output_line(line);
+                }
+            }
+        }
+        tool_activity::Description::Subagent { source, calls } => {
+            let label = source.unwrap_or("subagent");
+            emit(&format!(
+                "  {} #{} {}",
+                style("▸").dim(),
+                number,
+                style(label).dim()
+            ));
+            if calls.is_empty() {
+                emit(&format!("    {}", style("(no recorded tool calls)").dim()));
+            }
+            for call in calls {
+                emit(&format!(
+                    "    {}  {}  {}",
+                    call.time.format("%H:%M:%S"),
+                    style(&call.tool_name).dim(),
+                    call.args_summary
+                ));
+            }
+        }
+    }
+    emit("");
+}
+
 // Helper functions
 
-fn print_tool_header(call: &CallToolRequestParams) {
+/// `#<n> HH:MM:SS ` in front of a full-detail header, or nothing when the
+/// call isn't being tracked (legacy rendering, byte-identical to before).
+fn numbering_prefix(numbering: Option<(usize, DateTime<Local>)>) -> String {
+    match numbering {
+        Some((number, time)) => format!("#{number} {} ", time.format("%H:%M:%S")),
+        None => String::new(),
+    }
+}
+
+fn print_tool_header(call: &CallToolRequestParams, numbering: Option<(usize, DateTime<Local>)>) {
     let parts = ToolNameParts::from(call.name.as_ref());
+    let prefix = numbering_prefix(numbering);
     let tool_header = match parts.extension_name {
         Some(extension_name) => format!(
-            "  {} {} {}",
+            "  {} {}{} {}",
             style("▸").dim(),
+            prefix,
             style(parts.tool_name).dim(),
             style(extension_display_name(extension_name))
                 .magenta()
                 .dim(),
         ),
-        None => format!("  {} {}", style("▸").dim(), style(parts.tool_name).dim()),
+        None => format!(
+            "  {} {}{}",
+            style("▸").dim(),
+            prefix,
+            style(parts.tool_name).dim()
+        ),
     };
     emit("");
     emit(&format!("  {}", style("─".repeat(40)).dim()));
@@ -2402,36 +2591,6 @@ mod tests {
             }
             ValueLines::Single(_) => panic!("expected Multi"),
         }
-    }
-
-    #[test]
-    fn summarize_todos_counts_open_and_done() {
-        let content = "- [ ] task one\n- [x] task two\n- [ ] task three";
-        let summary = summarize_todos(content).expect("expected checkboxes");
-        assert_eq!(summary.open, 2);
-        assert_eq!(summary.done, 1);
-    }
-
-    #[test]
-    fn summarize_todos_handles_indented_items() {
-        let content = "- [ ] parent\n  - [ ] child\n  - [X] done child";
-        let summary = summarize_todos(content).expect("expected checkboxes");
-        assert_eq!(summary.open, 2);
-        assert_eq!(summary.done, 1);
-    }
-
-    #[test]
-    fn summarize_todos_returns_first_three_open_items() {
-        let content = "- [ ] one\n- [ ] two\n- [ ] three\n- [ ] four";
-        let summary = summarize_todos(content).expect("expected checkboxes");
-        assert_eq!(summary.open, 4);
-        assert_eq!(summary.next_open, vec!["one", "two", "three"]);
-    }
-
-    #[test]
-    fn summarize_todos_none_for_prose_without_checkboxes() {
-        let content = "Just a plain status update.\nNo checkboxes here.";
-        assert!(summarize_todos(content).is_none());
     }
 
     #[test]
