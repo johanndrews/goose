@@ -34,6 +34,19 @@ pub(super) fn take_show_last_block_request() -> bool {
     SHOW_LAST_BLOCK_REQUESTED.swap(false, Ordering::Relaxed)
 }
 
+/// Whether the turn-input prompt currently occupies the terminal's last
+/// line — the same condition `start`/`read_loop` already act on to hide the
+/// thinking spinner before it would be drawn over a half-typed/queued line.
+/// Exposed so any caller that might show the spinner (not just this module)
+/// can skip it while true, instead of each one reimplementing the check.
+pub(super) fn prompt_owns_the_line() -> bool {
+    prompt_drawn(&shared().state.lock().unwrap())
+}
+
+fn prompt_drawn(state: &State) -> bool {
+    state.running && state.prompt_shown
+}
+
 /// What the user typed while the turn was running.
 pub(super) struct Pending {
     /// Lines submitted with Enter, oldest first.
@@ -626,5 +639,22 @@ mod tests {
     #[test]
     fn pasted_newlines_are_shown_on_one_line() {
         assert_eq!(single_line("a\nb\r\nc"), "a b  c");
+    }
+
+    #[test]
+    fn prompt_drawn_requires_running_and_shown() {
+        let mut state = State {
+            running: true,
+            prompt_shown: true,
+            ..State::default()
+        };
+        assert!(prompt_drawn(&state));
+
+        state.prompt_shown = false;
+        assert!(!prompt_drawn(&state), "nothing on screen to collide with");
+
+        state.prompt_shown = true;
+        state.running = false;
+        assert!(!prompt_drawn(&state), "reader isn't even active");
     }
 }

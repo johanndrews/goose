@@ -225,7 +225,7 @@ pub struct PromptInfo {
 static THINKING: Mutex<ThinkingIndicator> = Mutex::new(ThinkingIndicator { spinner: None });
 
 pub fn show_thinking() {
-    if std::io::stdout().is_terminal() {
+    if std::io::stdout().is_terminal() && !super::turn_input::prompt_owns_the_line() {
         THINKING.lock().unwrap().show();
     }
 }
@@ -1264,12 +1264,17 @@ pub fn render_subagent_tool_call(
     let Some(activity) = activity else {
         return render_subagent_tool_call_legacy(call, debug);
     };
+
+    // Recorded regardless of display mode, so `/tools`/Ctrl+O and the
+    // eventual finalize line stay accurate even when full/legacy rendering
+    // is what's on screen right now.
+    let spinner_text =
+        activity.record_subagent_call(call.subagent_id, call.tool_name, call.arguments);
+
     if full_display_active(debug) {
         return render_subagent_tool_call_legacy(call, debug);
     }
 
-    let spinner_text =
-        activity.record_subagent_call(call.subagent_id, call.tool_name, call.arguments);
     if !is_showing_thinking() {
         show_thinking();
     }
