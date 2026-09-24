@@ -16,6 +16,14 @@ fn is_resolvable(caps: &Captures<'_>, names: &[String]) -> bool {
         .unwrap_or(true)
 }
 
+fn requires_tokens(caps: &Captures<'_>, names: &[String]) -> bool {
+    caps.name("idx").is_some()
+        || caps.name("pos").is_some()
+        || caps
+            .name("name")
+            .is_some_and(|m| names.iter().any(|n| n == m.as_str()))
+}
+
 pub(super) fn apply_skill_arguments(
     content: &str,
     raw_args: &str,
@@ -28,7 +36,15 @@ pub(super) fn apply_skill_arguments(
         return Ok(format!("{content}\n\nARGUMENTS: {raw_args}"));
     }
 
-    let tokens = split_command_args(raw_args)?;
+    let needs_tokens = PLACEHOLDER_RE
+        .captures_iter(content)
+        .any(|caps| requires_tokens(&caps, argument_names));
+
+    let tokens = if needs_tokens {
+        split_command_args(raw_args)?
+    } else {
+        Vec::new()
+    };
     let nth = |i: usize| tokens.get(i).cloned().unwrap_or_default();
 
     let rendered = PLACEHOLDER_RE.replace_all(content, |caps: &Captures<'_>| {
@@ -240,5 +256,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "foo / bar");
+    }
+
+    #[test]
+    fn arguments_only_with_unmatched_ascii_quote_substitutes_verbatim() {
+        let out = apply_skill_arguments("Run $ARGUMENTS now.", r#"say "hi"#, &[]).unwrap();
+        assert_eq!(out, r#"Run say "hi now."#);
+    }
+
+    #[test]
+    fn arguments_only_with_german_mixed_quotes_and_apostrophe_substitutes_verbatim() {
+        let out = apply_skill_arguments(
+            "Brief: $ARGUMENTS",
+            "„Das ist Johann's Brief mit „verschachtelten\" Anführungszeichen",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "Brief: „Das ist Johann's Brief mit „verschachtelten\" Anführungszeichen"
+        );
+    }
+
+    #[test]
+    fn arguments_index_placeholder_with_unmatched_quote_still_errs() {
+        let result = apply_skill_arguments("$ARGUMENTS[0]", r#""unterminated"#, &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn arguments_and_positional_together_with_unmatched_quote_errs() {
+        let result = apply_skill_arguments("raw=$ARGUMENTS pos=$1", r#""unterminated"#, &[]);
+        assert!(result.is_err());
     }
 }
