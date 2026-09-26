@@ -122,10 +122,11 @@ pub(super) fn start(cancel: CancellationToken, carried_over: String) -> Reader {
         };
     }
 
-    // The spinner and the prompt share the last terminal line, so a carried
-    // over prompt means the spinner has to go right away.
+    // The spinners and the prompt share the last terminal line, so a carried
+    // over prompt means they have to go right away.
     if carried_something_over {
         super::output::hide_thinking();
+        super::output::hide_progress();
     }
 
     std::thread::spawn(move || read_loop(cancel));
@@ -297,6 +298,7 @@ fn read_loop(cancel: CancellationToken) {
 
         if took_over_the_line {
             super::output::hide_thinking();
+            super::output::hide_progress();
         }
         if interrupt == Interrupt::Yes {
             cancel.cancel();

@@ -14,7 +14,7 @@ use goose::providers::canonical_cost::estimate_model_cost;
 use goose::subprocess::SubprocessExt;
 use goose::utils::safe_truncate;
 use goose_providers::conversation::token_usage::Usage;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rmcp::model::{CallToolRequestParams, ContentBlock, JsonObject, PromptArgument, Role};
 use serde_json::Value;
 use std::cell::RefCell;
@@ -268,6 +268,23 @@ pub fn show_thinking() {
 pub fn hide_thinking() {
     if std::io::stdout().is_terminal() {
         THINKING.lock().unwrap().hide();
+    }
+}
+
+/// Clone of the active session's `McpSpinners::multi_bar`, if any. Mirrors
+/// `THINKING`: the turn-input reader has no reference to the session's
+/// `McpSpinners`, but still needs to hide its progress bars the instant the
+/// user starts typing, since they share the terminal line with the prompt.
+static MCP_PROGRESS: Mutex<Option<MultiProgress>> = Mutex::new(None);
+
+/// Hides any MCP progress spinner immediately, mirroring `hide_thinking()`.
+/// Called from the turn-input reader when the user starts typing; `McpSpinners`
+/// itself also checks `turn_input::prompt_owns_the_line()` before every draw,
+/// so this only needs to cover the moment typing starts, not every tick.
+pub fn hide_progress() {
+    if let Some(multi) = MCP_PROGRESS.lock().unwrap().as_ref() {
+        let _ = multi.clear();
+        multi.set_draw_target(ProgressDrawTarget::hidden());
     }
 }
 
@@ -2159,15 +2176,38 @@ pub struct McpSpinners {
 
 impl McpSpinners {
     pub fn new() -> Self {
+        let multi_bar = MultiProgress::new();
+        *MCP_PROGRESS.lock().unwrap() = Some(multi_bar.clone());
         McpSpinners {
             bars: HashMap::new(),
             log_spinner: None,
             shell_output_lines: VecDeque::new(),
-            multi_bar: MultiProgress::new(),
+            multi_bar,
+        }
+    }
+
+    /// The turn-input prompt and MCP progress bars share the terminal's last
+    /// line, and neither knows how to redraw around the other. When the
+    /// prompt owns the line (queued or half-typed input), progress bars must
+    /// stay off it entirely rather than drawing over/into the prompt text.
+    fn draw_blocked_by_prompt(&mut self) -> bool {
+        if super::turn_input::prompt_owns_the_line() {
+            let _ = self.hide();
+            self.multi_bar.set_draw_target(ProgressDrawTarget::hidden());
+            true
+        } else {
+            if self.multi_bar.is_hidden() {
+                self.multi_bar.set_draw_target(ProgressDrawTarget::stderr());
+            }
+            false
         }
     }
 
     pub fn log(&mut self, message: &str) {
+        if self.draw_blocked_by_prompt() {
+            return;
+        }
+
         let spinner = self.log_spinner.get_or_insert_with(|| {
             let bar = self.multi_bar.add(
                 ProgressBar::new_spinner()
@@ -2193,6 +2233,10 @@ impl McpSpinners {
     }
 
     pub fn update(&mut self, token: &str, value: f64, total: Option<f64>, message: Option<&str>) {
+        if self.draw_blocked_by_prompt() {
+            return;
+        }
+
         let bar = self.bars.entry(token.to_string()).or_insert_with(|| {
             if let Some(total) = total {
                 self.multi_bar.add(
