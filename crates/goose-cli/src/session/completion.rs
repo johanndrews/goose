@@ -618,12 +618,15 @@ impl Hinter for GooseCompleter {
 }
 
 impl Highlighter for GooseCompleter {
+    /// The raw `prompt` is what rustyline measures for cursor/width math; this
+    /// styled copy is display-only and never changes its length in columns, so
+    /// that math stays correct.
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
         &'s self,
         prompt: &'p str,
         _default: bool,
     ) -> Cow<'b, str> {
-        Cow::Borrowed(prompt)
+        Cow::Owned(console::Style::new().cyan().apply_to(prompt).to_string())
     }
 
     fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
@@ -632,20 +635,29 @@ impl Highlighter for GooseCompleter {
         Cow::Owned(styled)
     }
 
+    /// The user's own input in the accent color, so it stands out from the
+    /// model's plain-colored replies; a recognized command name stays
+    /// distinguishable by staying bold on top of that color.
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        if line.is_empty() {
+            return Cow::Borrowed(line);
+        }
         let commands = self.known_commands();
         match highlighted_command_span(&commands, line) {
             Some(len) => {
                 let (command, rest) = line.split_at(len);
-                let styled = console::Style::new().cyan().apply_to(command);
-                Cow::Owned(format!("{styled}{rest}"))
+                let styled_command = console::Style::new().cyan().bold().apply_to(command);
+                let styled_rest = console::Style::new().cyan().apply_to(rest);
+                Cow::Owned(format!("{styled_command}{styled_rest}"))
             }
-            None => Cow::Borrowed(line),
+            None => Cow::Owned(console::Style::new().cyan().apply_to(line).to_string()),
         }
     }
 
+    /// Any non-empty line needs re-highlighting, not only slash commands, now
+    /// that plain text is colored too.
     fn highlight_char(&self, line: &str, _pos: usize, _cmd_kind: CmdKind) -> bool {
-        line.starts_with('/')
+        !line.is_empty()
     }
 }
 

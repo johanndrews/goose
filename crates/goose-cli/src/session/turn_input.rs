@@ -22,7 +22,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(40);
-const PROMPT: &str = "> ";
+const PROMPT: &str = "▌ ";
 
 /// Set by Ctrl+O on the turn-input reader thread; the main render loop polls
 /// and clears it between agent events, since the reader has no access to the
@@ -430,16 +430,28 @@ fn has_something_to_show(state: &State) -> bool {
     !state.line.is_empty() || !state.queued.is_empty()
 }
 
+/// [`PROMPT`]'s width in terminal columns, not bytes — `▌` is a single-column
+/// glyph encoded as 3 UTF-8 bytes, so `PROMPT.len()` would overstate the room
+/// it takes on screen and starve the budget the typed text gets.
+fn prompt_display_width() -> usize {
+    console::measure_text_width(PROMPT)
+}
+
 fn draw_prompt_line(state: &State) {
     let width = terminal_width();
     let badge = queue_badge(state.queued.len());
     let badge_room = badge.as_ref().map_or(0, |b| b.chars().count() + 2);
-    let budget = width.saturating_sub(PROMPT.len() + badge_room + 1);
+    let prompt_width = prompt_display_width();
+    let budget = width.saturating_sub(prompt_width + badge_room + 1);
     let typed = last_chars(&single_line(&state.line), budget);
 
-    let mut line = format!("\r\x1b[2K{}{}", PROMPT, typed);
+    let mut line = format!(
+        "\r\x1b[2K{}{}",
+        console::style(PROMPT).cyan(),
+        console::style(&typed).cyan()
+    );
     if let Some(badge) = badge {
-        let used = PROMPT.len() + typed.chars().count() + badge.chars().count();
+        let used = prompt_width + typed.chars().count() + badge.chars().count();
         line.push_str(&" ".repeat(width.saturating_sub(used + 1)));
         line.push_str(&console::style(badge).dim().to_string());
     }
@@ -630,6 +642,16 @@ mod tests {
         show_prompt(&mut state);
 
         assert!(!state.prompt_shown);
+    }
+
+    #[test]
+    fn prompt_width_is_measured_in_columns_not_bytes() {
+        assert_eq!(prompt_display_width(), 2);
+        assert_ne!(
+            prompt_display_width(),
+            PROMPT.len(),
+            "the bar glyph is multiple bytes but a single column"
+        );
     }
 
     #[test]

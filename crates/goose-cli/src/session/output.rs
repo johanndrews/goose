@@ -99,6 +99,20 @@ fn danger<T: Display>(value: T) -> StyledObject<T> {
     style(value).red()
 }
 
+/// The accent bar in front of the user's own input, so it reads apart from the
+/// model's plain-colored replies in a long session.
+const USER_INPUT_BAR: &str = "▌";
+
+/// The look of the user's own input in the transcript: [`USER_INPUT_BAR`] and
+/// the text both in the accent color, one bar per line so a multi-line message
+/// stays marked all the way down.
+pub(super) fn user_input_line(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("{} {}", accent(USER_INPUT_BAR), accent(line)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // Re-export theme for use in main
 #[derive(Clone, Copy)]
 pub enum Theme {
@@ -405,7 +419,13 @@ pub fn render_message(message: &Message, debug: bool, mut activity: Option<&mut 
                     println!("action_required(tool_confirmation_response): {}", id)
                 }
             },
-            MessageContent::Text(text) => print_markdown(&text.text, theme),
+            MessageContent::Text(text) => {
+                if message.role == Role::User {
+                    emit(&user_input_line(&text.text));
+                } else {
+                    print_markdown(&text.text, theme);
+                }
+            }
             MessageContent::ToolRequest(req) => {
                 render_tool_request(req, theme, debug, activity.as_deref_mut())
             }
@@ -480,7 +500,10 @@ pub fn render_message_streaming(
 
         match content {
             MessageContent::Text(text) => {
-                if let Some(safe_content) = buffer.push(&text.text) {
+                if message.role == Role::User {
+                    flush_markdown_buffer(buffer, theme);
+                    emit(&user_input_line(&text.text));
+                } else if let Some(safe_content) = buffer.push(&text.text) {
                     print_markdown(&safe_content, theme);
                 }
             }
@@ -964,7 +987,7 @@ pub fn render_error(message: &str) {
 /// Echoes a line that was typed during the previous turn as it is sent, so the
 /// transcript reads the same as if it had been typed at the prompt.
 pub fn render_sending_queued_input(line: &str) {
-    emit(&format!("> {}", line));
+    emit(&user_input_line(line));
 }
 
 pub fn render_blank_line() {
@@ -2744,6 +2767,31 @@ mod tests {
             }
             SessionNameSlot::Hidden => panic!("expected the name to be shown, truncated"),
         }
+    }
+
+    #[test]
+    fn user_input_line_marks_every_line_of_a_multiline_message() {
+        let rendered = user_input_line("first line\nsecond line");
+        let lines: Vec<&str> = rendered.lines().collect();
+
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            assert!(
+                line.contains(USER_INPUT_BAR),
+                "each line should carry the accent bar: {line}"
+            );
+        }
+        assert!(lines[0].contains("first line"));
+        assert!(lines[1].contains("second line"));
+    }
+
+    #[test]
+    fn user_input_line_marks_a_single_line_message() {
+        let rendered = user_input_line("Der Einwand trifft");
+
+        assert_eq!(rendered.lines().count(), 1);
+        assert!(rendered.contains(USER_INPUT_BAR));
+        assert!(rendered.contains("Der Einwand trifft"));
     }
 
     #[test]
