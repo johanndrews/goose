@@ -99,16 +99,17 @@ fn danger<T: Display>(value: T) -> StyledObject<T> {
     style(value).red()
 }
 
-/// The accent bar in front of the user's own input, so it reads apart from the
-/// model's plain-colored replies in a long session.
-const USER_INPUT_BAR: &str = "▌";
+/// The marker in front of the user's own input. ASCII on purpose, like the
+/// turn-input prompt: a glyph the terminal renders wider than `unicode-width`
+/// measures breaks the column budgets computed against it.
+const USER_INPUT_MARKER: &str = ">";
 
-/// The look of the user's own input in the transcript: [`USER_INPUT_BAR`] and
-/// the text both in the accent color, one bar per line so a multi-line message
-/// stays marked all the way down.
+/// The look of the user's own input in the transcript: [`USER_INPUT_MARKER`]
+/// and the text both in the accent color, one marker per line so a multi-line
+/// message stays marked all the way down.
 pub(super) fn user_input_line(text: &str) -> String {
     text.lines()
-        .map(|line| format!("{} {}", accent(USER_INPUT_BAR), accent(line)))
+        .map(|line| format!("{} {}", accent(USER_INPUT_MARKER), accent(line)))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -2777,8 +2778,8 @@ mod tests {
         assert_eq!(lines.len(), 2);
         for line in &lines {
             assert!(
-                line.contains(USER_INPUT_BAR),
-                "each line should carry the accent bar: {line}"
+                line.contains(USER_INPUT_MARKER),
+                "each line should carry the marker: {line}"
             );
         }
         assert!(lines[0].contains("first line"));
@@ -2790,7 +2791,7 @@ mod tests {
         let rendered = user_input_line("Der Einwand trifft");
 
         assert_eq!(rendered.lines().count(), 1);
-        assert!(rendered.contains(USER_INPUT_BAR));
+        assert!(rendered.contains(USER_INPUT_MARKER));
         assert!(rendered.contains("Der Einwand trifft"));
     }
 

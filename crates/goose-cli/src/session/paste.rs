@@ -367,9 +367,9 @@ pub(super) fn read_paste_aware_input(
     initial: &str,
 ) -> rustyline::Result<String> {
     let input = if initial.is_empty() {
-        editor.readline("▌ ")?
+        editor.readline("> ")?
     } else {
-        editor.readline_with_initial("▌ ", (initial, ""))?
+        editor.readline_with_initial("> ", (initial, ""))?
     };
     let expanded = paste_state
         .read()
