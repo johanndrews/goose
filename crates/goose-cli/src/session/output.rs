@@ -402,9 +402,10 @@ pub fn render_message(message: &Message, debug: bool, mut activity: Option<&mut 
                 ActionRequiredData::ElicitationResponse { id, .. } => {
                     emit(&format!("action_required(elicitation_response): {}", id))
                 }
-                ActionRequiredData::ToolConfirmationResponse { id, .. } => {
-                    println!("action_required(tool_confirmation_response): {}", id)
-                }
+                ActionRequiredData::ToolConfirmationResponse { id, .. } => emit(&format!(
+                    "action_required(tool_confirmation_response): {}",
+                    id
+                )),
             },
             MessageContent::Text(text) => {
                 if message.role == Role::User {
@@ -448,7 +449,7 @@ pub fn render_message(message: &Message, debug: bool, mut activity: Option<&mut 
             }
             MessageContent::Error(error) => {
                 hide_thinking();
-                println!("\n{} {}", danger("error:").bold(), &error.message);
+                emit(&format!("\n{} {}", danger("error:").bold(), error.message));
             }
             _ => {
                 eprintln!("WARNING: Message content type could not be rendered");
@@ -515,9 +516,10 @@ pub fn render_message_streaming(
                     ActionRequiredData::ElicitationResponse { id, .. } => {
                         emit(&format!("action_required(elicitation_response): {}", id))
                     }
-                    ActionRequiredData::ToolConfirmationResponse { id, .. } => {
-                        println!("action_required(tool_confirmation_response): {}", id)
-                    }
+                    ActionRequiredData::ToolConfirmationResponse { id, .. } => emit(&format!(
+                        "action_required(tool_confirmation_response): {}",
+                        id
+                    )),
                 }
             }
             MessageContent::Image(image) => {
@@ -556,7 +558,7 @@ pub fn render_message_streaming(
             MessageContent::Error(error) => {
                 flush_markdown_buffer(buffer, theme);
                 hide_thinking();
-                println!("\n{} {}", danger("error:").bold(), &error.message);
+                emit(&format!("\n{} {}", danger("error:").bold(), error.message));
             }
             _ => {
                 flush_markdown_buffer(buffer, theme);
@@ -577,7 +579,7 @@ fn reached_output_token_limit(message: &Message) -> bool {
 }
 
 fn render_output_token_limit_warning() {
-    println!("\n{}", warning(OUTPUT_TOKEN_LIMIT_WARNING));
+    emit(&format!("\n{}", warning(OUTPUT_TOKEN_LIMIT_WARNING)));
 }
 
 fn render_credits_exhausted_notification(notification: &SystemNotificationContent) {
@@ -748,7 +750,7 @@ fn dispatch_tool_request_rendering(
 
 fn emit_compact_request_line(line: &str) {
     ensure_line_start();
-    let width = terminal_width().map(|w| w.saturating_sub(2));
+    let width = terminal_width().map(|w| w.saturating_sub(2 + RIGHT_EDGE_RESERVE));
     let truncated = tool_activity::truncate_to_width(line, width);
     emit(&format!("  {}", style(truncated).dim()));
 }

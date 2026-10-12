@@ -416,13 +416,22 @@ fn compact_output_summary(text: &str, number: usize) -> Option<String> {
     }
 }
 
-/// Truncates to `width` characters, appending a single ellipsis when the
+/// Truncates to `width` terminal columns, appending a single ellipsis when the
 /// content had to be cut. `None` leaves the line untouched (no known
 /// terminal width, e.g. a pipe).
 pub(super) fn truncate_to_width(line: &str, width: Option<usize>) -> String {
     match width {
-        Some(width) if line.chars().count() > width && width > 1 => {
-            let mut truncated: String = line.chars().take(width - 1).collect();
+        Some(width) if width > 1 && console::measure_text_width(line) > width => {
+            let mut truncated = String::new();
+            let mut used = 0;
+            for c in line.chars() {
+                let char_width = console::measure_text_width(c.encode_utf8(&mut [0; 4]));
+                if used + char_width > width - 1 {
+                    break;
+                }
+                used += char_width;
+                truncated.push(c);
+            }
             truncated.push('…');
             truncated
         }
@@ -671,6 +680,14 @@ mod tests {
         assert_eq!(truncate_to_width("hello world", Some(5)), "hell…");
         assert_eq!(truncate_to_width("hi", Some(5)), "hi");
         assert_eq!(truncate_to_width("hello world", None), "hello world");
+    }
+
+    #[test]
+    fn truncate_to_width_measures_columns_not_chars() {
+        let truncated = truncate_to_width("日本語のコマンド", Some(7));
+        assert_eq!(truncated, "日本語…");
+        assert!(console::measure_text_width(&truncated) <= 7);
+        assert_eq!(truncate_to_width("日本語", Some(6)), "日本語");
     }
 
     #[test]
