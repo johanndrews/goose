@@ -7,6 +7,7 @@ use crate::{
     config::permission::PermissionManager,
     conversation::{message::Message, Conversation},
     prompt_template::render_template,
+    recipe::Recipe,
     session::extension_data::{EnabledExtensionsState, ExtensionState},
     session::{Session, SessionManager, SessionType},
 };
@@ -190,10 +191,32 @@ impl ForegroundSubagentRunner {
         if let Some(error) = subagent.conversation.as_ref().and_then(trailing_error) {
             return SubagentOutcome::Failed(format!("{error:?}"));
         }
-        SubagentOutcome::Failed(failure_reason(
-            messages.map(Vec::as_slice).unwrap_or_default(),
-        ))
+        let messages = messages.map(Vec::as_slice).unwrap_or_default();
+        if let Some(reply) = subagent
+            .recipe
+            .as_ref()
+            .and_then(|recipe| reply_without_final_output(recipe, messages))
+        {
+            return SubagentOutcome::Completed(reply);
+        }
+        SubagentOutcome::Failed(failure_reason(messages))
     }
+}
+
+/// Without a `response` no final_output tool is advertised, so the last assistant
+/// reply is the result. Hitting the turn limit leaves its own message last and
+/// never counts.
+fn reply_without_final_output(recipe: &Recipe, messages: &[Message]) -> Option<String> {
+    if recipe.response.is_some() {
+        return None;
+    }
+    let last = messages.last()?;
+    let text = last.as_concat_text();
+    (last.role == Role::Assistant
+        && !last.is_tool_call()
+        && !text.is_empty()
+        && text != MAX_TURNS_MESSAGE)
+        .then_some(text)
 }
 
 fn failure_reason(messages: &[Message]) -> String {
@@ -248,9 +271,10 @@ async fn build_subagent_prompt(
 
 #[cfg(test)]
 mod tests {
-    use super::failure_reason;
+    use super::{failure_reason, reply_without_final_output};
     use crate::agents::state_machine::MAX_TURNS_MESSAGE;
     use crate::conversation::message::Message;
+    use crate::recipe::{Recipe, Response};
 
     #[test]
     fn failure_reason_describes_how_the_subagent_stopped() {
@@ -280,6 +304,55 @@ mod tests {
         ];
         for (messages, expected) in cases {
             assert_eq!(failure_reason(&messages), expected);
+        }
+    }
+
+    fn recipe(response: Option<Response>) -> Recipe {
+        Recipe::builder()
+            .title("t")
+            .description("d")
+            .instructions("i")
+            .build()
+            .map(|mut recipe| {
+                recipe.response = response;
+                recipe
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn last_reply_is_the_result_only_when_no_final_output_was_advertised() {
+        let done = vec![
+            Message::user().with_text("go"),
+            Message::assistant().with_text("all done"),
+        ];
+        assert_eq!(
+            reply_without_final_output(&recipe(None), &done).as_deref(),
+            Some("all done")
+        );
+
+        let structured = Response {
+            json_schema: Some(serde_json::json!({"type": "object"})),
+        };
+        assert_eq!(
+            reply_without_final_output(&recipe(Some(structured)), &done),
+            None
+        );
+    }
+
+    #[test]
+    fn aborted_runs_have_no_reply_result() {
+        let cases = [
+            vec![],
+            vec![Message::user().with_text("go")],
+            vec![Message::assistant().with_text("")],
+            vec![
+                Message::assistant().with_text("halfway there"),
+                Message::assistant().with_text(MAX_TURNS_MESSAGE),
+            ],
+        ];
+        for messages in cases {
+            assert_eq!(reply_without_final_output(&recipe(None), &messages), None);
         }
     }
 }

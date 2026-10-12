@@ -856,7 +856,7 @@ impl SummonClient {
             .resolve_subagent_config(&params, &recipe, parent)
             .await
             .map_err(|e| format!("Failed to resolve subagent config: {e}"))?;
-        crate::providers::get_from_registry(&subagent_config.provider_name)
+        let provider_entry = crate::providers::get_from_registry(&subagent_config.provider_name)
             .await
             .map_err(|_| {
                 format!(
@@ -875,22 +875,33 @@ impl SummonClient {
                 max_turns: None,
             })
             .max_turns = Some(max_turns);
-        if recipe
+        let has_structured_response = recipe
             .response
             .as_ref()
-            .and_then(|response| response.json_schema.as_ref())
-            .is_none()
-        {
-            recipe.response = Some(Response {
-                json_schema: Some(serde_json::json!({
-                    "type": "object",
-                    "properties": {"summary": {"type": "string"}},
-                    "required": ["summary"]
-                })),
-            });
+            .is_some_and(|response| response.json_schema.is_some());
+        if provider_entry.runs_own_tool_loop() {
+            // Such a provider never receives goose's final_output tool, so a
+            // response schema could not be satisfied.
+            if has_structured_response {
+                return Err(format!(
+                    "Delegate '{}' declares a structured `response`, but provider '{}' runs its own tool loop and never receives goose's final_output tool. Remove the `response` block or delegate with a different provider.",
+                    recipe.title, subagent_config.provider_name
+                ));
+            }
+            recipe.response = None;
+        } else {
+            if !has_structured_response {
+                recipe.response = Some(Response {
+                    json_schema: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {"summary": {"type": "string"}},
+                        "required": ["summary"]
+                    })),
+                });
+            }
+            FinalOutputTool::try_new(recipe.response.as_ref().unwrap().clone())
+                .map_err(|e| format!("Invalid delegate response schema: {e}"))?;
         }
-        FinalOutputTool::try_new(recipe.response.as_ref().unwrap().clone())
-            .map_err(|e| format!("Invalid delegate response schema: {e}"))?;
 
         let mut extension_data = ExtensionData::default();
         EnabledExtensionsState::new(subagent_config.extensions)
@@ -1489,6 +1500,99 @@ mod tests {
             scheduler: None,
             use_login_shell_path: false,
         }
+    }
+
+    async fn delegate_with_provider(
+        provider: &str,
+        extra_args: serde_json::Value,
+        recipe_yaml: Option<&str>,
+    ) -> (Result<CallToolResult, String>, Option<Session>) {
+        let temp_dir = TempDir::new().unwrap();
+        if let Some(yaml) = recipe_yaml {
+            let recipes = temp_dir.path().join(".goose/recipes");
+            fs::create_dir_all(&recipes).unwrap();
+            fs::write(recipes.join("reviewer.yaml"), yaml).unwrap();
+        }
+        let manager = Arc::new(crate::session::SessionManager::new(
+            temp_dir.path().to_path_buf(),
+        ));
+        let parent = manager
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "Parent".to_string(),
+                SessionType::User,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+        manager
+            .update(&parent.id)
+            .provider_name("openai")
+            .model_config(goose_providers::model::ModelConfig::new("test-model"))
+            .apply()
+            .await
+            .unwrap();
+        let client =
+            SummonClient::new(create_test_context_with_session_manager(manager.clone())).unwrap();
+        let mut args = serde_json::json!({
+            "provider": provider,
+            "model": "test-model",
+            "extensions": [],
+            "max_turns": 3
+        });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra_args.as_object().unwrap().clone());
+        let result = client
+            .handle_delegate(
+                &parent.id,
+                temp_dir.path(),
+                Some(args.as_object().unwrap().clone()),
+            )
+            .await;
+        let child = match &result {
+            Ok(result) => {
+                let id = result.meta.as_ref().unwrap().0["subagent_session_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                Some(manager.get_session(&id, true).await.unwrap())
+            }
+            Err(_) => None,
+        };
+        (result, child)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn delegate_to_provider_running_own_tool_loop_gets_no_injected_response() {
+        let (result, child) = delegate_with_provider(
+            "claude-acp",
+            serde_json::json!({"instructions": "Review the change"}),
+            None,
+        )
+        .await;
+        result.unwrap();
+        assert!(child.unwrap().recipe.unwrap().response.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn delegate_with_response_to_provider_running_own_tool_loop_fails_early() {
+        let (result, child) = delegate_with_provider(
+            "claude-acp",
+            serde_json::json!({"source": "reviewer"}),
+            Some(
+                "version: 1.0.0\ntitle: Reviewer\ndescription: Reviews\ninstructions: Review\nresponse:\n  json_schema:\n    type: object\n",
+            ),
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("Reviewer") && error.contains("claude-acp"),
+            "{error}"
+        );
+        assert!(child.is_none());
     }
 
     #[tokio::test]
