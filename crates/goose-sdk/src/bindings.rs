@@ -11,7 +11,7 @@ use futures::StreamExt;
 use goose_providers::{
     anthropic::AnthropicProviderBuilder,
     api_client::{ApiClient, AuthMethod},
-    base::{MessageStream, Provider as GooseProvider},
+    base::{MessageStream, ModelInfo, Provider as GooseProvider},
     conversation::{
         message::{Message, MessageContent as GooseMessageContent},
         token_usage::ProviderUsage,
@@ -489,6 +489,25 @@ pub struct ProviderModelConfig {
     pub request_headers: Option<HashMap<String, String>>,
 }
 
+/// A model advertised by the provider. Providers without model discovery
+/// return an empty list rather than an error.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ProviderModelInfo {
+    pub name: String,
+    pub context_limit: Option<u64>,
+    pub supports_reasoning: bool,
+}
+
+impl From<ModelInfo> for ProviderModelInfo {
+    fn from(info: ModelInfo) -> Self {
+        Self {
+            name: info.name,
+            context_limit: info.context_limit.map(|limit| limit as u64),
+            supports_reasoning: info.reasoning,
+        }
+    }
+}
+
 impl ProviderModelConfig {
     fn to_goose_model_config(&self, provider_name: &str) -> Result<ModelConfig, GooseError> {
         let mut config = ModelConfig::new(&self.model_name)
@@ -745,6 +764,13 @@ impl ProviderHandle {
                 .await
         })
         .await
+    }
+
+    async fn list_models(&self) -> Result<Vec<ProviderModelInfo>, GooseError> {
+        let provider = Arc::clone(&self.provider);
+        let models =
+            run_on_runtime(async move { provider.fetch_supported_model_info().await }).await??;
+        Ok(models.into_iter().map(ProviderModelInfo::from).collect())
     }
 
     async fn stream(
@@ -1098,6 +1124,10 @@ impl Provider {
         Ok(self.handle.context_limit(model).await? as u64)
     }
 
+    pub async fn list_models(&self) -> Result<Vec<ProviderModelInfo>, GooseError> {
+        self.handle.list_models().await
+    }
+
     pub async fn stream(
         &self,
         model: ProviderModelConfig,
@@ -1309,11 +1339,8 @@ pub fn openai_provider(
         api_client = api_client.with_query(query_params);
     }
 
-    // For the real OpenAI API, model-based routing is correct — Responses-family
-    // models should go to /v1/responses. For custom hosts, always keep chat
-    // completions: a server may include `/v1` in its URL without implementing
-    // the Responses endpoint, and the versionless path still matches the
-    // `is_chat_completions_path()` check below.
+    // Keep custom hosts on Chat Completions: a server may include `/v1`
+    // without supporting Responses.
     let base_path = if is_openai {
         if has_v1 {
             OPEN_AI_DEFAULT_BASE_PATH.to_string()
@@ -1326,6 +1353,7 @@ pub fn openai_provider(
 
     let provider = OpenAiProviderBuilder::new(api_client)
         .base_path(base_path)
+        .native_openai(is_openai)
         .preserve_thinking_context(!is_openai)
         .build();
 

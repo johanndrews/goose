@@ -34,7 +34,7 @@ use crate::commands::schedule::{
     handle_schedule_run_now, handle_schedule_services_status, handle_schedule_services_stop,
     handle_schedule_sessions,
 };
-use crate::commands::session::{handle_session_list, handle_session_remove};
+use crate::commands::session::{handle_session_list, handle_session_remove, handle_session_rename};
 use crate::commands::skills::handle_skills_list;
 use crate::recipes::extract_from_cli::extract_recipe_info_from_cli;
 use crate::recipes::recipe::{explain_recipe, render_recipe_as_yaml};
@@ -571,36 +571,17 @@ enum SessionCommand {
         #[arg(
             long = "format",
             value_name = "FORMAT",
-            help = "Output format (markdown, json, yaml)",
+            help = "Output format (markdown, json, yaml, html)",
             default_value = "markdown"
         )]
         format: String,
-
-        #[arg(
-            long = "nostr",
-            help = "Publish the JSON session export as an encrypted Nostr event and print a Goose share link"
-        )]
-        nostr: bool,
-
-        #[arg(
-            long = "relay",
-            value_name = "RELAY",
-            help = "Nostr relay URL to publish to (can be specified multiple times)",
-            action = clap::ArgAction::Append
-        )]
-        relays: Vec<String>,
     },
-    #[command(
-        about = "Import a session from JSON, a Claude Code / Codex / Pi .jsonl, or an encrypted Nostr share link"
-    )]
+    #[command(about = "Import a session from JSON or a Claude Code / Codex / Pi .jsonl")]
     Import {
         #[arg(
-            help = "Path to a goose session export, a Claude Code, Codex, or Pi .jsonl transcript, or a goose://sessions/nostr share link"
+            help = "Path to a goose session export, or a Claude Code, Codex, or Pi .jsonl transcript"
         )]
         input: String,
-
-        #[arg(long = "nostr", help = "Treat input as an encrypted Nostr share link")]
-        nostr: bool,
     },
     #[command(name = "diagnostics")]
     Diagnostics {
@@ -609,6 +590,19 @@ enum SessionCommand {
 
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
+    },
+    #[command(about = "Rename a session")]
+    Rename {
+        #[arg(
+            long = "session-id",
+            alias = "id",
+            value_name = "SESSION_ID",
+            help = "Session ID to rename (e.g., '20250921_143022'). If omitted, prompts interactively."
+        )]
+        session_id: Option<String>,
+
+        #[arg(short = 'n', long = "new-name", help = "New name for the session")]
+        new_name: String,
     },
 }
 
@@ -1152,7 +1146,7 @@ enum Command {
 
         /// Disable the Rust-driven parallel orchestrator and fall back to
         /// the single-prompt path that asks the main agent to delegate
-        /// each check via `delegate(... async: true ...)`. The default
+        /// each check via `delegate(...)`. The default
         /// orchestrator dispatches one `goose run` subprocess per check
         /// (capped at 4 concurrent), bounding wall-clock to the slowest
         /// single check rather than waiting on the model to issue
@@ -1454,7 +1448,8 @@ enum McpProbeElicitation {
 }
 
 async fn handle_mcp_probe(extension_command: String, script_path: Option<String>) -> Result<()> {
-    use goose::agents::{Agent, AgentConfig, ToolCallContext};
+    use goose::agents::extension_manager::CallRequest;
+    use goose::agents::{Agent, AgentConfig};
     use goose::config::ExtensionConfig;
     use rmcp::model::{ElicitRequestParams, ElicitResult, ElicitationAction};
     use tokio_util::sync::CancellationToken;
@@ -1513,7 +1508,6 @@ async fn handle_mcp_probe(extension_command: String, script_path: Option<String>
         std::sync::Arc::new(SessionManager::instance()),
         goose::config::permission::PermissionManager::instance(),
         None,
-        config.get_goose_mode().unwrap_or_default(),
         true,
         GoosePlatform::GooseCli,
     );
@@ -1562,7 +1556,7 @@ async fn handle_mcp_probe(extension_command: String, script_path: Option<String>
             std::env::current_dir()?,
             "MCP Probe".to_string(),
             goose::session::session_manager::SessionType::Hidden,
-            agent.config.goose_mode,
+            config.get_goose_mode().unwrap_or_default(),
         )
         .await?;
     let session_id = session.id.as_str();
@@ -1570,44 +1564,36 @@ async fn handle_mcp_probe(extension_command: String, script_path: Option<String>
 
     let mut results = Vec::new();
     for step in script.steps {
+        let lease = agent.extension_manager.current_lease(session_id).await?;
         let result = match step {
             McpProbeStep::ListTools => serde_json::json!({
                 "action": "listTools",
-                "result": agent.extension_manager.list_tools_from_extension(
-                    session_id,
+                "result": lease.list_tools_from_extension(
                     "probe",
                     CancellationToken::new(),
                 ).await?,
             }),
             McpProbeStep::ListPrompts => serde_json::json!({
                 "action": "listPrompts",
-                "result": agent.extension_manager.list_prompts_from_extension(
-                    session_id,
+                "result": lease.list_prompts_from_extension(
                     "probe",
                     CancellationToken::new(),
                 ).await?,
             }),
             McpProbeStep::ListResources => serde_json::json!({
                 "action": "listResources",
-                "result": agent.extension_manager.list_resources_result_from_extension(
-                    session_id,
+                "result": lease.list_resources_result_from_extension(
                     "probe",
                     CancellationToken::new(),
                 ).await?,
             }),
             McpProbeStep::CallTool { name, arguments } => {
                 let scoped_name = format!("probe__{name}");
-                let ctx = ToolCallContext::new(
-                    session_id.to_string(),
-                    Some(std::env::current_dir()?),
-                    Some("mcp-probe-tool-call".to_string()),
-                );
-                let result = agent
-                    .extension_manager
-                    .dispatch_tool_call(
-                        &ctx,
+                let result = lease
+                    .call(
                         rmcp::model::CallToolRequestParams::new(scoped_name)
                             .with_arguments(arguments),
+                        CallRequest::new("mcp-probe-tool-call"),
                         CancellationToken::new(),
                     )
                     .await?
@@ -1948,8 +1934,6 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
             identifier,
             output,
             format,
-            nostr,
-            relays,
         } => {
             let session_manager = SessionManager::instance();
             let session_identifier = if let Some(id) = identifier {
@@ -1967,17 +1951,11 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
                     }
                 }
             };
-            crate::commands::session::handle_session_export(
-                session_identifier,
-                output,
-                format,
-                nostr,
-                relays,
-            )
-            .await?;
+            crate::commands::session::handle_session_export(session_identifier, output, format)
+                .await?;
         }
-        SessionCommand::Import { input, nostr } => {
-            crate::commands::session::handle_session_import(input, nostr).await?;
+        SessionCommand::Import { input } => {
+            crate::commands::session::handle_session_import(input).await?;
         }
         SessionCommand::Diagnostics { identifier, output } => {
             let session_manager = SessionManager::instance();
@@ -1997,6 +1975,28 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
                 }
             };
             crate::commands::session::handle_diagnostics(&session_id, output).await?;
+        }
+        SessionCommand::Rename {
+            session_id,
+            new_name,
+        } => {
+            let session_manager = SessionManager::instance();
+            let session_id = if let Some(id) = session_id {
+                id
+            } else {
+                match crate::commands::session::prompt_interactive_session_selection(
+                    &session_manager,
+                )
+                .await
+                {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        return Ok(());
+                    }
+                }
+            };
+            handle_session_rename(session_id, new_name).await?;
         }
     }
     Ok(())

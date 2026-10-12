@@ -323,36 +323,22 @@ pub fn show_extensions_ready() {
 
 pub fn show_extension_failures(failures: &[ExtensionFailure]) {
     for failure in failures {
-        match failure.label.as_deref() {
-            None => {
-                eprintln!(
-                    "{}",
-                    style(format!(
-                        "  ⚠ Failed to start extensions ({})",
-                        failure.error
-                    ))
-                    .yellow()
-                );
-            }
-            Some(label) => {
-                eprintln!(
-                    "{}",
-                    style(format!(
-                        "  ⚠ Failed to start extension '{}' ({}), continuing without it",
-                        label, failure.error
-                    ))
-                    .yellow()
-                );
-                eprintln!(
-                    "{}",
-                    style(format!(
-                        "    Hint: ask goose to help debug the '{}' extension",
-                        label
-                    ))
-                    .dim()
-                );
-            }
-        }
+        eprintln!(
+            "{}",
+            style(format!(
+                "  ⚠ Failed to start extension '{}' ({}), continuing without it",
+                failure.label, failure.error
+            ))
+            .yellow()
+        );
+        eprintln!(
+            "{}",
+            style(format!(
+                "    Hint: ask goose to help debug the '{}' extension",
+                failure.label
+            ))
+            .dim()
+        );
     }
 }
 
@@ -453,7 +439,7 @@ pub fn render_message(message: &Message, debug: bool, mut activity: Option<&mut 
                     }
                     SystemNotificationType::InlineMessage => {
                         hide_thinking();
-                        emit(&format!("\n{} {}", style("·").dim(), &notification.msg));
+                        emit(&format!("\n{} {}", style("·").dim(), notification.msg));
                     }
                     SystemNotificationType::CreditsExhausted => {
                         render_credits_exhausted_notification(notification);
@@ -559,7 +545,7 @@ pub fn render_message_streaming(
                     SystemNotificationType::InlineMessage => {
                         flush_markdown_buffer(buffer, theme);
                         hide_thinking();
-                        emit(&format!("\n{} {}", style("·").dim(), &notification.msg));
+                        emit(&format!("\n{} {}", style("·").dim(), notification.msg));
                     }
                     SystemNotificationType::CreditsExhausted => {
                         flush_markdown_buffer(buffer, theme);
@@ -599,7 +585,7 @@ fn render_credits_exhausted_notification(notification: &SystemNotificationConten
     emit(&format!(
         "\n{} {}",
         warning("warning:").bold(),
-        &notification.msg
+        notification.msg
     ));
 
     if let Some(url) = notification
@@ -663,11 +649,17 @@ pub fn goose_mode_message(text: &str) {
     emit(&format!("\n{} {}", accent("mode:"), text));
 }
 
+/// Any value of the environment variable turns thinking output on, which is what the
+/// documentation promises; the configured boolean is read only when it is not set.
+fn thinking_enabled(config: &Config) -> bool {
+    std::env::var_os("GOOSE_CLI_SHOW_THINKING").is_some()
+        || config
+            .get_param::<bool>("GOOSE_CLI_SHOW_THINKING")
+            .unwrap_or(false)
+}
+
 fn should_show_thinking() -> bool {
-    Config::global()
-        .get_param::<bool>("GOOSE_CLI_SHOW_THINKING")
-        .unwrap_or(false)
-        && std::io::stdout().is_terminal()
+    thinking_enabled(Config::global()) && std::io::stdout().is_terminal()
 }
 
 fn render_thinking(text: &str, theme: Theme) {
@@ -779,15 +771,17 @@ fn content_annotations(content: &ContentBlock) -> Option<&rmcp::model::Annotatio
     }
 }
 
-fn content_passes_filter(content: &ContentBlock, min_priority: f32, debug: bool) -> bool {
+fn content_passes_filter(content: &ContentBlock, min_priority: f32) -> bool {
     let annotations = content_annotations(content);
     if let Some(audience) = annotations.and_then(|a| a.audience.as_ref()) {
         if !audience.contains(&Role::User) {
             return false;
         }
     }
-    let priority = annotations.and_then(|a| a.priority);
-    !(priority.is_some_and(|priority| priority < min_priority) || (priority.is_none() && !debug))
+    // Tools without a priority annotation default to 0.0 (the same as
+    // DEFAULT_MIN_PRIORITY), so they are shown at the default threshold and
+    // only hidden when the user raises it.
+    annotations.and_then(|a| a.priority).unwrap_or(0.0) >= min_priority
 }
 
 fn render_tool_response(resp: &ToolResponse, debug: bool, activity: Option<&mut ToolActivity>) {
@@ -802,7 +796,7 @@ fn render_tool_response_legacy(resp: &ToolResponse, debug: bool) {
         Ok(result) => {
             let min_priority = min_priority_config();
             for content in &result.content {
-                if !content_passes_filter(content, min_priority, debug) {
+                if !content_passes_filter(content, min_priority) {
                     continue;
                 }
                 if debug {
@@ -818,12 +812,12 @@ fn render_tool_response_legacy(resp: &ToolResponse, debug: bool) {
     }
 }
 
-fn filtered_response_text(result: &rmcp::model::CallToolResult, debug: bool) -> String {
+fn filtered_response_text(result: &rmcp::model::CallToolResult) -> String {
     let min_priority = min_priority_config();
     result
         .content
         .iter()
-        .filter(|content| content_passes_filter(content, min_priority, debug))
+        .filter(|content| content_passes_filter(content, min_priority))
         .filter_map(|content| content.as_text().map(|t| t.text.clone()))
         .collect::<Vec<_>>()
         .join("\n")
@@ -832,7 +826,7 @@ fn filtered_response_text(result: &rmcp::model::CallToolResult, debug: bool) -> 
 fn render_tool_response_tracked(resp: &ToolResponse, debug: bool, activity: &mut ToolActivity) {
     let (text, is_error, meta) = match &resp.tool_result {
         Ok(result) => (
-            filtered_response_text(result, debug),
+            filtered_response_text(result),
             result.is_error.unwrap_or(false),
             result.meta.as_deref(),
         ),
@@ -2312,6 +2306,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::env;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn recent_lines_accumulate_across_updates() {
@@ -2811,5 +2806,51 @@ mod tests {
             }
             SessionNameSlot::Hidden => panic!("expected the name to be shown, truncated"),
         }
+    }
+
+    fn config_with(contents: &str) -> (Config, NamedTempFile, NamedTempFile) {
+        let config_file = NamedTempFile::new().unwrap();
+        let secrets_file = NamedTempFile::new().unwrap();
+        std::fs::write(config_file.path(), contents).unwrap();
+        let config =
+            Config::new_with_file_secrets(config_file.path(), secrets_file.path()).unwrap();
+        (config, config_file, secrets_file)
+    }
+
+    #[test]
+    fn any_environment_value_shows_thinking() {
+        let _guard = env_lock::lock_env([("GOOSE_CLI_SHOW_THINKING", Some("1"))]);
+        let (config, _config_file, _secrets_file) = config_with("");
+
+        assert!(thinking_enabled(&config));
+    }
+
+    #[test]
+    fn empty_environment_value_shows_thinking() {
+        let _guard = env_lock::lock_env([("GOOSE_CLI_SHOW_THINKING", Some(""))]);
+        let (config, _config_file, _secrets_file) = config_with("");
+
+        assert!(thinking_enabled(&config));
+    }
+
+    #[test]
+    fn configured_value_is_used_when_the_variable_is_unset() {
+        let _guard = env_lock::lock_env([("GOOSE_CLI_SHOW_THINKING", None::<&str>)]);
+
+        let (enabled, _c1, _s1) = config_with("GOOSE_CLI_SHOW_THINKING: true\n");
+        assert!(thinking_enabled(&enabled));
+
+        let (disabled, _c2, _s2) = config_with("GOOSE_CLI_SHOW_THINKING: false\n");
+        assert!(!thinking_enabled(&disabled));
+
+        let (unset, _c3, _s3) = config_with("");
+        assert!(!thinking_enabled(&unset));
+    }
+
+    #[test]
+    fn thinking_output_needs_a_terminal() {
+        let _guard = env_lock::lock_env([("GOOSE_CLI_SHOW_THINKING", Some("1"))]);
+
+        assert_eq!(should_show_thinking(), std::io::stdout().is_terminal());
     }
 }
