@@ -48,7 +48,11 @@ strsim = "0.11"
 tempfile = { workspace = true }
 etcetera = { workspace = true }
 rand = { workspace = true }
-rustyline = { version = "18", default-features = false, features = ["custom-bindings", "with-dirs", "with-file-history"] }
+# `signal-hook`: without it rustyline installs its SIGWINCH handler with a bare
+# `sigaction`, which this crate's tokio runtime overwrites. rustyline then never
+# learns the terminal was resized and keeps redrawing the line against the old
+# width, leaving a copy of it behind on every keystroke.
+rustyline = { version = "18", default-features = false, features = ["custom-bindings", "signal-hook", "with-dirs", "with-file-history"] }
 tracing = { workspace = true }
 chrono = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json", "time"] }
